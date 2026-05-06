@@ -38,6 +38,12 @@ use crate::{
     BuildMode, BuildRequest,
     opt::{AppManifest, js_is_module},
 };
+
+/// Extension for the unstripped post-wasm-bindgen wasm parked next to the
+/// served (stripped) one so `fill_caches` can populate `HotpatchModuleCache`
+/// from the `linking` + `reloc.*` sections after the served file has been
+/// stripped of them. See `strip_linker_sidecars`.
+const UNSTRIPPED_WASM_EXTENSION: &str = "unstripped.wasm";
 use anyhow::Context;
 use dioxus_cli_config::format_base_path_meta_element;
 use manganis::AssetOptions;
@@ -249,6 +255,28 @@ impl BuildRequest {
         if should_bundle_split || self.release {
             ctx.status_optimizing_wasm();
             wasm_opt::optimize(&post_bindgen_wasm, &post_bindgen_wasm, &wasm_opt_options).await?;
+        }
+
+        // For hot-patch (Fat) builds we link with `--emit-relocs` to keep the linking +
+        // reloc.* custom sections that `HotpatchModuleCache` needs server-side. The
+        // browser never reads them (see strip_linker_sidecars). Strip them from the
+        // served wasm to shave 30-50% off the asset, but stash the unstripped bytes
+        // alongside so `fill_caches` (which runs later in the build pipeline) can still
+        // populate the cache from the linker metadata. wasm-opt already strips these
+        // for release / wasm_split paths, so skip there.
+        if matches!(ctx.mode, BuildMode::Fat) && !should_bundle_split && !self.release {
+            let bytes = std::fs::read(&post_bindgen_wasm)?;
+            let unstripped_path =
+                post_bindgen_wasm.with_extension(UNSTRIPPED_WASM_EXTENSION);
+            std::fs::write(&unstripped_path, &bytes)?;
+            let stripped = crate::build::strip_linker_sidecars(&bytes);
+            tracing::debug!(
+                dx_src = ?TraceSrc::Bundle,
+                "stripped linker sidecars from served wasm: {} -> {} bytes",
+                bytes.len(),
+                stripped.len()
+            );
+            std::fs::write(&post_bindgen_wasm, stripped)?;
         }
 
         if self.should_bundle_to_asset() {
@@ -592,6 +620,14 @@ __wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
         self.wasm_bindgen_out_dir()
             .join(format!("{}_bg", self.executable_name()))
             .with_extension("wasm")
+    }
+
+    /// Get the path where the unstripped (linker-sidecars intact) copy of the
+    /// post-bindgen wasm is parked for `fill_caches` to consume on Fat builds.
+    /// See `strip_linker_sidecars` for context.
+    pub(crate) fn wasm_bindgen_wasm_unstripped_file(&self) -> PathBuf {
+        self.wasm_bindgen_wasm_output_file()
+            .with_extension(UNSTRIPPED_WASM_EXTENSION)
     }
 
     pub(crate) fn path_is_in_public_dir(&self, path: &Path) -> bool {

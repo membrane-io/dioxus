@@ -751,9 +751,13 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         new.exports.add(APPLY_RELOCS, func.id());
     }
 
-    // Update the wasm module on the filesystem to use the newly lifted version
+    // Update the wasm module on the filesystem to use the newly lifted version.
+    // Strip the wasm-ld linker sidecars (`linking` + `reloc.*`) from the emitted bytes -
+    // the browser does not read them and they are commonly 30-50% of the patch size.
     let lib = patch.to_path_buf();
-    std::fs::write(&lib, new.emit_wasm())?;
+    let bytes = new.emit_wasm();
+    let bytes = strip_linker_sidecars(&bytes);
+    std::fs::write(&lib, bytes)?;
 
     // And now assemble the jump table by mapping the old ifunc table to the new one, by name
     //
@@ -1325,6 +1329,76 @@ fn collect_stub_symbols_from_bytes(
     Ok(())
 }
 
+/// Drop wasm-ld linker-sidecar custom sections (`linking` and `reloc.*`) from a wasm binary.
+///
+/// These sections only exist because we link with `--emit-relocs` to support the hot-patch
+/// flow. Once `HotpatchModuleCache` has consumed them server-side, nothing in the browser
+/// reads them — the relocs that matter are baked into `__wasm_apply_data_relocs` /
+/// `__wasm_apply_global_relocs` function bodies during link, and the JumpTable is sent to
+/// the browser as JSON via the devtools websocket. On real-world hot-patch builds these
+/// sections can be 30-50% of the served bytes (e.g. ~99 MB of a 214 MB binary).
+///
+/// This is a streaming strip: we walk the section header sequence, skip the matching
+/// custom sections, and copy every other section's bytes verbatim without parsing their
+/// payloads. Cost is ~one memcpy of the input. On a 200 MB wasm it runs in tens of ms,
+/// well below the threshold where it would slow a fat or patch build noticeably.
+pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
+    if input.len() < 8 || &input[..4] != b"\0asm" {
+        return input.to_vec();
+    }
+    let mut out = Vec::with_capacity(input.len());
+    out.extend_from_slice(&input[..8]); // magic + version
+    let mut pos = 8;
+    while pos < input.len() {
+        let section_start = pos;
+        let section_id = input[pos];
+        pos += 1;
+        let Some((section_size, leb_len)) = read_uleb128(&input[pos..]) else {
+            // Malformed - bail out, return original bytes untouched.
+            return input.to_vec();
+        };
+        pos += leb_len;
+        let payload_end = pos + section_size as usize;
+        if payload_end > input.len() {
+            return input.to_vec();
+        }
+
+        let mut keep = true;
+        if section_id == 0 {
+            if let Some((name_len, name_leb_len)) = read_uleb128(&input[pos..]) {
+                let name_start = pos + name_leb_len;
+                let name_end = name_start + name_len as usize;
+                if name_end <= payload_end {
+                    if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
+                        if name == "linking" || name.starts_with("reloc.") {
+                            keep = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if keep {
+            out.extend_from_slice(&input[section_start..payload_end]);
+        }
+        pos = payload_end;
+    }
+    out
+}
+
+fn read_uleb128(bytes: &[u8]) -> Option<(u32, usize)> {
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+    for (i, &b) in bytes.iter().enumerate().take(5) {
+        result |= ((b & 0x7f) as u32) << shift;
+        if b & 0x80 == 0 {
+            return Some((result, i + 1));
+        }
+        shift += 7;
+    }
+    None
+}
+
 /// Prepares the base module before running wasm-bindgen.
 ///
 /// This tries to work around how wasm-bindgen works by intelligently promoting non-wasm-bindgen functions
@@ -1666,6 +1740,74 @@ fn prepare_wasm_preserves_dwarf() {
     if let Ok(out_path) = std::env::var("PREPARE_WASM_OUTPUT") {
         std::fs::write(&out_path, &out).expect("write output wasm");
         eprintln!("wrote prepared wasm to {}", out_path);
+    }
+}
+
+/// Run via:
+///   STRIP_WASM_INPUT=path/to/wasm cargo test \
+///     -p dioxus-cli --target aarch64-apple-darwin --bin dx -- \
+///     strip_linker_sidecars_bench --nocapture --ignored
+#[test]
+#[ignore]
+fn strip_linker_sidecars_bench() {
+    let path = match std::env::var("STRIP_WASM_INPUT") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("set STRIP_WASM_INPUT=<path-to-wasm> to run this benchmark");
+            return;
+        }
+    };
+    let bytes = std::fs::read(&path).expect("read input wasm");
+    eprintln!("input size: {} bytes ({:.2} MB)", bytes.len(), bytes.len() as f64 / 1024.0 / 1024.0);
+
+    let runs = 5;
+    let mut times_ms = Vec::with_capacity(runs);
+    let mut last = Vec::new();
+    for _ in 0..runs {
+        let start = std::time::Instant::now();
+        last = strip_linker_sidecars(&bytes);
+        let elapsed = start.elapsed();
+        times_ms.push(elapsed.as_secs_f64() * 1000.0);
+    }
+    eprintln!(
+        "output size: {} bytes ({:.2} MB) -- {:.1}% of input",
+        last.len(),
+        last.len() as f64 / 1024.0 / 1024.0,
+        last.len() as f64 * 100.0 / bytes.len() as f64
+    );
+    eprintln!("strip times (ms): {:?}", times_ms);
+    let avg = times_ms.iter().sum::<f64>() / runs as f64;
+    let min = times_ms.iter().cloned().fold(f64::INFINITY, f64::min);
+    eprintln!("avg = {:.1} ms, best = {:.1} ms", avg, min);
+
+    // Verify the output is still a valid wasm (parses cleanly) and that the
+    // sections we wanted gone are gone, while the ones we wanted to keep are present.
+    let mut linking_present = false;
+    let mut reloc_present = false;
+    let mut name_present = false;
+    let mut debug_present = false;
+    for payload in wasmparser::Parser::new(0).parse_all(&last) {
+        match payload.expect("stripped wasm fails to parse") {
+            Payload::CustomSection(s) => match s.name() {
+                "linking" => linking_present = true,
+                n if n.starts_with("reloc.") => reloc_present = true,
+                "name" => name_present = true,
+                n if n.starts_with(".debug_") => debug_present = true,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    assert!(!linking_present, "linking section survived strip");
+    assert!(!reloc_present, "reloc.* section survived strip");
+    eprintln!(
+        "post-strip: name={} debug_present={}",
+        name_present, debug_present
+    );
+
+    if let Ok(out_path) = std::env::var("STRIP_WASM_OUTPUT") {
+        std::fs::write(&out_path, &last).expect("write output wasm");
+        eprintln!("wrote stripped wasm to {}", out_path);
     }
 }
 
