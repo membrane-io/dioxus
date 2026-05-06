@@ -476,7 +476,12 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
 
-    let mut new = Module::from_buffer(&new_bytes)?;
+    // Preserve DWARF custom sections through walrus so source-level stack traces
+    // continue to resolve in hot-patched code. With the default `ModuleConfig`,
+    // walrus drops every `.debug_*` section at emit time.
+    let mut config = ModuleConfig::new();
+    config.generate_dwarf(true);
+    let mut new = Module::from_buffer_with_config(&new_bytes, &config)?;
     let mut got_mems = vec![];
     let mut got_funcs = vec![];
     let mut wbg_funcs = vec![];
@@ -1332,7 +1337,7 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         ids,
         symbols,
         ..
-    } = parse_module_with_ids(bytes)?;
+    } = parse_module_with_ids_config(bytes, true)?;
 
     // Due to monomorphizations, functions will get merged and multiple names will point to the same function.
     // Walrus loses this information, so we need to manually parse the names table to get the indices
@@ -1545,6 +1550,46 @@ fn bindgen_symbol_catch() {
     assert!(!name_is_bindgen_symbol("__wbindgen_free"));
 }
 
+/// Run via:
+///   PREPARE_WASM_INPUT=path/to/cargo-built.wasm cargo test \
+///     -p dioxus-cli --target aarch64-apple-darwin -- \
+///     prepare_wasm_preserves_dwarf --nocapture --ignored
+#[test]
+#[ignore]
+fn prepare_wasm_preserves_dwarf() {
+    let path = match std::env::var("PREPARE_WASM_INPUT") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("set PREPARE_WASM_INPUT=<path-to-wasm> to run this test");
+            return;
+        }
+    };
+    let bytes = std::fs::read(&path).expect("read input wasm");
+    eprintln!("input bytes={}", bytes.len());
+
+    let out = prepare_wasm_base_module(&bytes).expect("prepare_wasm_base_module");
+    eprintln!("output bytes={}", out.len());
+
+    let mut debug_total = 0usize;
+    for payload in wasmparser::Parser::new(0).parse_all(&out) {
+        if let Ok(Payload::CustomSection(s)) = payload {
+            if s.name().starts_with(".debug_") {
+                eprintln!("  output has {} (size={})", s.name(), s.data().len());
+                debug_total += s.data().len();
+            }
+        }
+    }
+    assert!(
+        debug_total > 0,
+        ".debug_* sections were stripped by walrus — DWARF lost"
+    );
+
+    if let Ok(out_path) = std::env::var("PREPARE_WASM_OUTPUT") {
+        std::fs::write(&out_path, &out).expect("write output wasm");
+        eprintln!("wrote prepared wasm to {}", out_path);
+    }
+}
+
 /// Manually parse the data section from a wasm module
 ///
 /// We need to do this for data symbols because walrus doesn't provide the right range and offset
@@ -1659,21 +1704,36 @@ struct ParsedModule<'a> {
 /// Parse a module and return the mapping of index to FunctionID.
 /// We'll use this mapping to remap ModuleIDs
 fn parse_module_with_ids(bindgened: &[u8]) -> Result<ParsedModule<'_>> {
+    parse_module_with_ids_config(bindgened, false)
+}
+
+/// Same as `parse_module_with_ids` but lets the caller request DWARF preservation.
+///
+/// Walrus drops every `.debug_*` custom section at emit time unless `generate_dwarf` is set.
+/// Callers that re-emit the wasm to disk (e.g. `prepare_wasm_base_module`) need
+/// `generate_dwarf=true` so source-level stack traces survive the transform; callers that
+/// only inspect the parsed `Module` should leave it `false` to skip the extra DWARF parse.
+fn parse_module_with_ids_config(
+    bindgened: &[u8],
+    generate_dwarf: bool,
+) -> Result<ParsedModule<'_>> {
     let ids = Arc::new(RwLock::new(Vec::new()));
     let ids_ = ids.clone();
-    let module = Module::from_buffer_with_config(
-        bindgened,
-        ModuleConfig::new().on_parse(move |_m, our_ids| {
-            let mut ids = ids_.write().expect("No shared writers");
-            let mut idx = 0;
-            while let Ok(entry) = our_ids.get_func(idx) {
-                ids.push(entry);
-                idx += 1;
-            }
+    let mut config = ModuleConfig::new();
+    if generate_dwarf {
+        config.generate_dwarf(true);
+    }
+    config.on_parse(move |_m, our_ids| {
+        let mut ids = ids_.write().expect("No shared writers");
+        let mut idx = 0;
+        while let Ok(entry) = our_ids.get_func(idx) {
+            ids.push(entry);
+            idx += 1;
+        }
 
-            Ok(())
-        }),
-    )?;
+        Ok(())
+    });
+    let module = Module::from_buffer_with_config(bindgened, &config)?;
     let mut ids_ = ids.write().expect("No shared writers");
     let mut ids = vec![];
     std::mem::swap(&mut ids, &mut *ids_);
