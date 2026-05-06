@@ -2309,11 +2309,32 @@ impl BuildRequest {
         if matches!(ctx.mode, BuildMode::Fat) {
             ctx.profile_phase("Creating Patch Cache");
             let patch_exe = match self.bundle {
-                BundleFormat::Web => self.wasm_bindgen_wasm_output_file(),
+                BundleFormat::Web => {
+                    // The bundle step strips `linking` + `reloc.*` from the served
+                    // wasm and parks an unstripped copy alongside for the cache to
+                    // read from. Prefer it when present; fall back to the served
+                    // file otherwise (which is the right behavior for builds where
+                    // the strip didn't run, e.g. wasm_split / release).
+                    let unstripped = self.wasm_bindgen_wasm_unstripped_file();
+                    if unstripped.exists() {
+                        unstripped
+                    } else {
+                        self.wasm_bindgen_wasm_output_file()
+                    }
+                }
                 _ => artifacts.exe.to_path_buf(),
             };
             let hotpatch_module_cache = HotpatchModuleCache::new(&patch_exe, &self.triple)?;
             artifacts.patch_cache = Some(Arc::new(hotpatch_module_cache));
+
+            // The unstripped sibling is only needed by the cache; remove it now to
+            // avoid leaving 100s of MB of duplicate wasm in target/.
+            if matches!(self.bundle, BundleFormat::Web) {
+                let unstripped = self.wasm_bindgen_wasm_unstripped_file();
+                if unstripped.exists() {
+                    let _ = std::fs::remove_file(&unstripped);
+                }
+            }
         }
 
         Ok(())
