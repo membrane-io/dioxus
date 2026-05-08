@@ -486,6 +486,10 @@ impl AppServer {
                 let old_syn = syn::parse_file(&cached_file.contents);
                 let new_syn = syn::parse_file(&new_contents);
                 let (Ok(old_file), Ok(new_file)) = (old_syn, new_syn) else {
+                    if self.client.stage == BuildStage::Failed {
+                        needs_rust_rebuild = true;
+                        break;
+                    }
                     tracing::debug!("Diff rsx returned not parseable");
                     continue;
                 };
