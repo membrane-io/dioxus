@@ -27,6 +27,14 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache};
 
+/// How many hot-patches to apply between sweeps of leftover rustc `save-temps` byproducts.
+///
+/// Each thin build leaves dead `.bc`/`.ll`/`.s`/`.rcgu.o` files in the `deps/` dir that grow without
+/// bound (see [`BuildRequest::clean_thin_build_byproducts`]). The sweep is just a directory walk plus
+/// some `unlink`s — cheap (a few ms) — so this is small. Raise it if the sweep ever shows up in
+/// hot-patch timings; lower it to keep peak disk usage tighter.
+const HOTPATCH_CLEANUP_INTERVAL: usize = 2;
+
 /// The component of the serve engine that watches ongoing builds and manages their state, open handle,
 /// and progress.
 ///
@@ -894,6 +902,21 @@ impl AppBuilder {
 
         // Commit this patch
         self.patches.push(jump_table.clone());
+
+        // Periodically sweep the dead `save-temps` byproducts that thin builds leave in `deps/`,
+        // which otherwise grow without bound across a long serve session. We log every sweep so its
+        // effect on hot-patch timing is easy to spot.
+        if self.patches.len().is_multiple_of(HOTPATCH_CLEANUP_INTERVAL) {
+            let sweep_start = SystemTime::now();
+            let (files_removed, bytes_freed) = self
+                .build
+                .clean_thin_build_byproducts(&res.workspace_rustc.link_args);
+            tracing::info!(
+                "Cleaned {files_removed} hot-patch build byproduct(s) ({:.1} MB) in {} ms",
+                bytes_freed as f64 / (1024.0 * 1024.0),
+                sweep_start.elapsed().map(|d| d.as_millis()).unwrap_or(0),
+            );
+        }
 
         Ok(jump_table)
     }

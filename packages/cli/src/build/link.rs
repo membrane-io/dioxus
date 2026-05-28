@@ -833,6 +833,43 @@ impl BuildRequest {
         path.with_extension(extension)
     }
 
+    /// Sweep leftover `-Csave-temps=true` byproducts out of the thin-build `deps/` directory.
+    ///
+    /// Thin (hot-patch) builds pass `-Csave-temps=true` (see [`BuildRequest::cargo_build_arguments`])
+    /// so that the per-codegen-unit `.rcgu.o` object files survive on disk for us to link the patch
+    /// manually. As a side effect, rustc *also* leaves the LLVM IR/bitcode siblings it produced for
+    /// each codegen unit — `.no-opt.bc`, `.opt.bc`, `.rcgu.bc`, `.ll`, `.s` — and nothing in the
+    /// patch flow ever reads those again. Because codegen-unit filenames are content-hashed, every
+    /// patch that touches code emits a *fresh* set of these files without overwriting the previous
+    /// one, so a long `dx serve` session accumulates them without bound (observed: tens of GB).
+    ///
+    /// The only loose objects we ever link are the tip crate's current `.rcgu.o` set, and those are
+    /// deleted immediately after the link in [`BuildRequest::compile_workspace_hotpatch`] (workspace
+    /// dep crates are linked via their `.rlib`, not loose objects). So any `.rcgu.o` still sitting in
+    /// `deps/` at sweep time is also a stale byproduct and safe to remove — rustc will regenerate
+    /// whatever the next build needs. We deliberately leave `.rmeta`/`.rlib` and the `incremental/`
+    /// cache alone; those are cargo's to manage.
+    ///
+    /// `link_args` are the captured rustc link args from the just-completed build; we derive the
+    /// `deps/` directory from them (rather than reconstructing `target/<triple>/<profile>/deps`) so
+    /// the path is correct regardless of whether cargo emitted a triple subdir.
+    ///
+    /// Returns `(files_removed, bytes_freed)`.
+    pub(crate) fn clean_thin_build_byproducts(&self, link_args: &[String]) -> (usize, u64) {
+        // Find the deps dir from the first link arg that lives under our target dir and points at a
+        // codegen-unit object. If we can't (e.g. an all-rlib link), there's nothing to sweep.
+        let Some(deps_dir) = link_args
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.starts_with(&self.target_dir) && p.to_string_lossy().ends_with(".rcgu.o"))
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        else {
+            return (0, 0);
+        };
+
+        sweep_thin_build_byproducts(&deps_dir)
+    }
+
     /// When we link together the fat binary, we need to make sure every `.o` file in *every* rlib
     /// is taken into account. This is the same work that the rust compiler does when assembling
     /// staticlibs.
@@ -1533,4 +1570,116 @@ fn dep_info_path_for_rustc_args(args: &[String]) -> Option<PathBuf> {
     let out_dir = out_dir?;
     let crate_name = crate_name?;
     Some(PathBuf::from(out_dir).join(format!("{crate_name}{extra}.d")))
+}
+
+/// Filename suffixes that are pure `-Csave-temps=true` byproducts: rustc emits one per codegen unit
+/// and nothing in the patch/link flow ever reads them back. `.rcgu.o` is included because the only
+/// loose objects we link are the tip crate's *current* set, which is deleted right after the link in
+/// [`BuildRequest::compile_workspace_hotpatch`] — any `.rcgu.o` lingering at sweep time is stale.
+const THIN_BUILD_BYPRODUCT_SUFFIXES: &[&str] = &[
+    ".no-opt.bc",
+    ".opt.bc",
+    ".rcgu.bc",
+    ".rcgu.o",
+    ".ll",
+    ".s",
+];
+
+fn is_thin_build_byproduct(file_name: &str) -> bool {
+    THIN_BUILD_BYPRODUCT_SUFFIXES
+        .iter()
+        .any(|suffix| file_name.ends_with(suffix))
+}
+
+/// Delete every [`is_thin_build_byproduct`] file directly inside `deps_dir`. Non-recursive on
+/// purpose — rustc writes these alongside the `.rlib`/`.rmeta` outputs in the single `deps/` dir.
+/// Returns `(files_removed, bytes_freed)`.
+fn sweep_thin_build_byproducts(deps_dir: &Path) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(deps_dir) else {
+        return (0, 0);
+    };
+
+    let mut files_removed = 0;
+    let mut bytes_freed = 0;
+    for entry in entries.flatten() {
+        if !is_thin_build_byproduct(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(entry.path()).is_ok() {
+            files_removed += 1;
+            bytes_freed += len;
+        }
+    }
+
+    (files_removed, bytes_freed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byproduct_predicate_matches_only_save_temps_files() {
+        // Byproducts that should be swept.
+        for name in [
+            "app-1a2b.05stnb4bovskp7a00wyyf7l9s.rcgu.o",
+            "app-1a2b.05stnb4bovskp7a00wyyf7l9s.rcgu.bc",
+            "app-1a2b.05stnb4bovskp7a00wyyf7l9s.no-opt.bc",
+            "app-1a2b.05stnb4bovskp7a00wyyf7l9s.opt.bc",
+            "app-1a2b.ll",
+            "app-1a2b.s",
+        ] {
+            assert!(is_thin_build_byproduct(name), "{name} should be swept");
+        }
+
+        // Artifacts cargo/dx still need must be preserved.
+        for name in [
+            "libapp-1a2b.rlib",
+            "libapp-1a2b.rmeta",
+            "app-1a2b.d",
+            "libapp.so",
+            "app.wasm",
+            "stub.o",
+        ] {
+            assert!(!is_thin_build_byproduct(name), "{name} should be kept");
+        }
+    }
+
+    #[test]
+    fn sweep_removes_byproducts_and_keeps_real_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = dir.path();
+
+        let byproducts = [
+            "app-1a2b.cgu0.rcgu.o",
+            "app-1a2b.cgu0.no-opt.bc",
+            "app-1a2b.cgu1.opt.bc",
+            "dep-9z8y.cgu0.rcgu.o",
+        ];
+        let keep = ["libapp-1a2b.rlib", "libapp-1a2b.rmeta", "app-1a2b.d"];
+
+        for name in byproducts.iter().chain(keep.iter()) {
+            std::fs::write(deps.join(name), b"x").unwrap();
+        }
+
+        let (removed, bytes) = sweep_thin_build_byproducts(deps);
+        assert_eq!(removed, byproducts.len());
+        assert_eq!(bytes, byproducts.len() as u64); // 1 byte each
+
+        for name in byproducts {
+            assert!(!deps.join(name).exists(), "{name} should be gone");
+        }
+        for name in keep {
+            assert!(deps.join(name).exists(), "{name} should remain");
+        }
+    }
+
+    #[test]
+    fn sweep_missing_dir_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert_eq!(sweep_thin_build_byproducts(&missing), (0, 0));
+    }
 }
