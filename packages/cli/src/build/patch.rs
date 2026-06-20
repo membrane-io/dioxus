@@ -1433,7 +1433,7 @@ pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
                 let name_end = name_start + name_len as usize;
                 if name_end <= payload_end {
                     if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
-                        if name == "linking" || name.starts_with("reloc.") {
+                        if should_strip_custom_section(name) {
                             keep = false;
                         }
                     }
@@ -1447,6 +1447,41 @@ pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
         pos = payload_end;
     }
     out
+}
+
+/// Custom sections the served patch doesn't need, stripped to shrink the bytes the browser fetches
+/// and the runtime instantiates.
+///
+/// The browser only needs the standard sections to *run* the patch. We deliberately keep the DWARF
+/// sections that `addr2line` consumes for click-to-source symbolication — `.debug_info`,
+/// `.debug_abbrev`, `.debug_line`(+`.debug_line_str`), `.debug_str`(+`.debug_str_offsets`),
+/// `.debug_addr`, and `.debug_ranges`/`.debug_rnglists` — plus `dylink.0`. Everything else goes:
+/// wasm-ld bookkeeping (`linking`/`reloc.*`), build metadata, the wasm `name` section (the
+/// symbolicator reads raw `0x` code offsets from the stack and resolves names from DWARF, never from
+/// this section — so it's pure weight, and the largest strippable one), and the DWARF
+/// accelerator/variable sections `addr2line` never reads for line/frame lookup.
+fn should_strip_custom_section(name: &str) -> bool {
+    name.starts_with("reloc.")
+        || matches!(
+            name,
+            "linking"
+                | "name"
+                | "producers"
+                | "target_features"
+                | ".debug_aranges"
+                | ".debug_pubnames"
+                | ".debug_pubtypes"
+                | ".debug_gnu_pubnames"
+                | ".debug_gnu_pubtypes"
+                | ".debug_loc"
+                | ".debug_loclists"
+                | ".debug_frame"
+                | ".eh_frame"
+                | ".debug_macro"
+                | ".debug_macinfo"
+                | ".debug_cu_index"
+                | ".debug_tu_index"
+        )
 }
 
 fn read_uleb128(bytes: &[u8]) -> Option<(u32, usize)> {
