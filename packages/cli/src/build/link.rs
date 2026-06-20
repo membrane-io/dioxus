@@ -149,15 +149,32 @@ impl BuildRequest {
         // Replay the rustcs for all modified workspace crates. This is not the final tip binary.
         // Note that the final tip might include itself as a lib (lib.rs + main.rs) which gets covered here.
         ctx.profile_phase("Workspace hotpatch replay");
-        let replayed_crates = self.workspace_hotpatch_replay_order(modified_crates)?;
-        tracing::debug!("replaying crates: {replayed_crates:?}");
-        for crate_name in &replayed_crates {
-            let rustc_args = self
-                .workspace_hotpatch_replay_args(workspace_rustc_args, crate_name)
-                .with_context(|| format!("Missing rustc args for replay: '{crate_name}'"))?;
-            self.compile_dep_crate(ctx, crate_name, rustc_args)
-                .await
-                .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))?;
+        let replay_levels = self.workspace_hotpatch_replay_levels(modified_crates)?;
+        let replayed_crates: Vec<String> = replay_levels.iter().flatten().cloned().collect();
+        tracing::debug!(
+            "replaying {} crates in {} dependency levels: {replay_levels:?}",
+            replayed_crates.len(),
+            replay_levels.len()
+        );
+
+        // Crates within a level have no dependency edge between them, so they can compile
+        // concurrently (each rustc is its own subprocess). Levels are strictly sequential: a
+        // dependent can't compile until its dependency's rlib exists, so we await each level
+        // fully before starting the next.
+        for level in &replay_levels {
+            let mut level_jobs = Vec::with_capacity(level.len());
+            for crate_name in level {
+                let rustc_args = self
+                    .workspace_hotpatch_replay_args(workspace_rustc_args, crate_name)
+                    .with_context(|| format!("Missing rustc args for replay: '{crate_name}'"))?;
+                level_jobs.push((crate_name, rustc_args));
+            }
+            let level_futures = level_jobs.into_iter().map(|(crate_name, rustc_args)| async move {
+                self.compile_dep_crate(ctx, crate_name, rustc_args)
+                    .await
+                    .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))
+            });
+            futures_util::future::try_join_all(level_futures).await?;
         }
 
         // Recompile just the tip crate now
@@ -680,17 +697,21 @@ impl BuildRequest {
         })
     }
 
-    /// Topological sort of modified workspace crates for rustc replay.
+    /// Topological sort of modified workspace crates for rustc replay, grouped into dependency
+    /// *levels*.
     ///
-    /// The caller (builder) already guarantees that every crate in `modified_crates`
-    /// transitively reaches the tip. This function excludes the tip crate itself — it
-    /// gets compiled separately via `cargo_build` after the replay. The remaining lib
-    /// crates are ordered so dependencies compile before dependents (Kahn's algorithm).
-    /// Ties are broken lexicographically for determinism.
-    fn workspace_hotpatch_replay_order(
+    /// The caller (builder) already guarantees that every crate in `modified_crates` transitively
+    /// reaches the tip. This excludes the tip crate itself — it gets compiled separately via
+    /// `cargo_build` after the replay.
+    ///
+    /// Every crate in a level depends only on crates in earlier levels, so crates within a single
+    /// level have no edge between them and can be compiled concurrently. Levels are emitted in
+    /// dependency order (each level's rlibs must exist before the next level compiles), and crates
+    /// within a level are sorted lexicographically for determinism.
+    fn workspace_hotpatch_replay_levels(
         &self,
         modified_crates: &HashSet<String>,
-    ) -> Result<Vec<String>> {
+    ) -> Result<Vec<Vec<String>>> {
         // Exclude the tip crate — it's compiled separately via cargo_build after replay.
         // Modified crates are tracked by *package* name, which can differ from the bin
         // target name (`tip_crate_name()`), e.g. package `browser` with `[[bin]] name = "blitz"`.
@@ -713,30 +734,37 @@ impl BuildRequest {
             }
         }
 
-        // Kahn's algorithm. BTreeSet gives deterministic (lexicographic) tie-breaking.
+        // Layered Kahn's algorithm. Each pass drains every currently-ready (indegree 0) crate as a
+        // single level, then releases their dependents into the next level. BTreeSet keeps each
+        // level lexicographically ordered for determinism.
         let mut ready: BTreeSet<&String> = indegree
             .iter()
             .filter(|&(_, &deg)| deg == 0)
             .map(|(name, _)| *name)
             .collect();
-        let mut ordered = Vec::with_capacity(crates.len());
-        while let Some(name) = ready.pop_first() {
-            ordered.push(name.clone());
-            for dep in edges.get(name).into_iter().flatten() {
-                let deg = indegree.get_mut(dep).unwrap();
-                *deg -= 1;
-                if *deg == 0 {
-                    ready.insert(dep);
+        let mut levels: Vec<Vec<String>> = Vec::new();
+        let mut emitted = 0usize;
+        while !ready.is_empty() {
+            let level: Vec<&String> = std::mem::take(&mut ready).into_iter().collect();
+            emitted += level.len();
+            for &name in &level {
+                for dep in edges.get(name).into_iter().flatten() {
+                    let deg = indegree.get_mut(dep).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        ready.insert(dep);
+                    }
                 }
             }
+            levels.push(level.into_iter().cloned().collect());
         }
 
         ensure!(
-            ordered.len() == crates.len(),
+            emitted == crates.len(),
             "Cycle in workspace dependency graph — cannot determine replay order"
         );
 
-        Ok(ordered)
+        Ok(levels)
     }
 
     /// Collect the rlib paths for every replayed workspace crate, ordered for the linker.
