@@ -44,6 +44,20 @@ pub struct JumpTable {
     /// The amount of ifuncs this will register. This is used by WASM to know how much space to allocate
     /// for the ifuncs in the ifunc table
     pub ifunc_count: u64,
+
+    /// (wasm only) Pairs of `(old_ifunc_index, new_ifunc_index)` whose old/new functions have
+    /// identical wasm signatures and are therefore safe to overwrite in place in the indirect
+    /// function table after the patch is instantiated.
+    ///
+    /// Overwriting old table slots with the new function makes already-existing, type-erased values
+    /// (trait-object vtables, `drop_in_place`/`type_id` glue captured before the patch) dispatch into
+    /// the patched code instead of the stale original, which avoids crashes when such values outlive a
+    /// patch. The signature filter is essential: at high opt levels several differently-typed symbols
+    /// can collapse onto one ifunc index, so a name-matched `map` entry may pair an old slot with a
+    /// new function of a different signature — overwriting those would corrupt unrelated `call_indirect`
+    /// sites. New indices are pre-rebase (the runtime adds `__table_base`).
+    #[serde(default)]
+    pub ifunc_repoint: Vec<(u64, u64)>,
 }
 
 /// An address to address hashmap that does not hash addresses since addresses are by definition unique.

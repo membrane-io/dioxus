@@ -20,7 +20,7 @@ use target_lexicon::{Architecture, OperatingSystem, PointerWidth, Triple};
 use thiserror::Error;
 use walrus::{
     ConstExpr, DataKind, ElementItems, ElementKind, FunctionBuilder, FunctionId, FunctionKind,
-    ImportKind, Module, ModuleConfig, TableId,
+    ImportKind, Module, ModuleConfig, TableId, ValType,
 };
 use wasmparser::{
     BinaryReader, BinaryReaderError, Linking, LinkingSectionReader, Payload, SymbolInfo,
@@ -402,6 +402,7 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         new_base_address,
         aslr_reference,
         ifunc_count: 0,
+        ifunc_repoint: Vec::new(),
     })
 }
 
@@ -453,6 +454,7 @@ pub fn create_native_jump_table(
         new_base_address,
         aslr_reference,
         ifunc_count: 0,
+        ifunc_repoint: Vec::new(),
     })
 }
 
@@ -774,12 +776,39 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         }
     }
 
+    // Determine which old table slots are safe to overwrite in place with the patched function.
+    //
+    // Repointing an old slot to the new function makes type-erased values that were created before
+    // the patch (trait-object vtables, `drop_in_place`/`type_id` glue) dispatch into patched code
+    // instead of the stale original. Because the patch's `GOT.func` entries resolve to *old* ifunc
+    // indices, both pre- and post-patch vtables reference those old slots, so this also preserves
+    // function-pointer identity across the boundary.
+    //
+    // We only repoint slots whose old and new functions have identical signatures. The `map` is
+    // matched by name and, at high opt levels, several differently-typed symbols can collapse onto
+    // one ifunc index, so a name-matched pair may otherwise install a wrong-signature funcref and
+    // corrupt unrelated `call_indirect` sites.
+    let old_sigs = collect_ifunc_signatures(old);
+    let new_sigs = collect_ifunc_signatures(&new);
+    let mut ifunc_repoint = Vec::new();
+    for (&old_idx, &new_idx) in map.iter() {
+        if let (Some(old_sig), Some(new_sig)) = (
+            old_sigs.get(&(old_idx as i32)),
+            new_sigs.get(&(new_idx as i32)),
+        ) {
+            if old_sig == new_sig {
+                ifunc_repoint.push((old_idx, new_idx));
+            }
+        }
+    }
+
     Ok(JumpTable {
         map,
         lib,
         ifunc_count,
         aslr_reference: 0,
         new_base_address: 0,
+        ifunc_repoint,
     })
 }
 
@@ -859,6 +888,40 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
     }
 
     func_to_offset
+}
+
+/// Map every ifunc-table index to the wasm signature of the function in that slot.
+///
+/// Used to decide which `map` entries are safe to overwrite in place at runtime: only pairs whose
+/// old and new slots share the exact same `(params, results)` may be repointed. A name-matched pair
+/// is *not* enough, because at high opt levels several differently-typed symbols can collapse onto a
+/// single ifunc index.
+fn collect_ifunc_signatures(m: &Module) -> HashMap<i32, (Vec<ValType>, Vec<ValType>)> {
+    let mut idx_to_sig = HashMap::new();
+    for el in m.elements.iter() {
+        let ElementKind::Active { offset, .. } = &el.kind else {
+            continue;
+        };
+
+        let offset = match offset {
+            ConstExpr::Value(walrus::ir::Value::I32(idx)) => *idx,
+            ConstExpr::Value(walrus::ir::Value::I64(idx)) => *idx as i32,
+            ConstExpr::Global(_) => 0,
+            _ => continue,
+        };
+
+        if let ElementItems::Functions(ids) = &el.items {
+            for (i, id) in ids.iter().enumerate() {
+                let ty = m.types.get(m.funcs.get(*id).ty());
+                idx_to_sig.insert(
+                    offset + i as i32,
+                    (ty.params().to_vec(), ty.results().to_vec()),
+                );
+            }
+        }
+    }
+
+    idx_to_sig
 }
 
 /// Resolve the undefined symbols in the incrementals against the original binary, returning an object

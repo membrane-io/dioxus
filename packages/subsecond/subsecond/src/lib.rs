@@ -653,34 +653,64 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
         let imports = Object::new();
         Reflect::set(&imports, &"env".into(), &env).unwrap();
 
-        // Async instantiation of the precompiled module. We use the
-        // (Module, imports) form of `WebAssembly.instantiate`, which
-        // resolves directly to an `Instance` (not `{module, instance}`).
-        // This is the no-size-limit path; the synchronous
-        // `new WebAssembly.Instance` constructor is capped at 8MB on
-        // Chrome's main thread.
-        let instance: Instance = JsFuture::from(WebAssembly::instantiate_module(&module, &imports))
+        // Async instantiation of the precompiled module. This is the no-size-limit path; the
+        // synchronous `new WebAssembly.Instance` constructor is capped at 8MB on Chrome's main
+        // thread.
+        //
+        // The resolved value depends on the binding/runtime: `WebAssembly.instantiate(module, …)`
+        // is specified to resolve to a bare `Instance`, but in practice the value we get back here
+        // is a `{ module, instance }` result object. Reading `.exports()` off that wrapper yields
+        // `undefined`, which silently disables every relocation below (the `Reflect::get` lookups
+        // just return `Err`), leaving patch-local vtables pointing at un-rebased table indices.
+        // Handle both shapes explicitly.
+        let resolved = JsFuture::from(WebAssembly::instantiate_module(&module, &imports))
             .await
-            .unwrap()
-            .unchecked_into();
+            .unwrap();
+        let instance: Instance = if resolved.is_instance_of::<Instance>() {
+            resolved.unchecked_into()
+        } else {
+            Reflect::get(&resolved, &"instance".into())
+                .expect("instantiate result missing `instance`")
+                .unchecked_into()
+        };
         let inst_exports: Object = instance.exports();
 
-        // Run the patch's relocation thunks and constructors. Order
-        // matters: data relocs first (write memory_base- and table_base-
-        // relative pointers into the patch's data segment), then global
-        // relocs (adjust GOT.func.internal globals by __table_base —
-        // wasm-ld synthesizes those as element-segment-relative offsets),
-        // then ctors. `dyn_into` instead of `unchecked_into` so missing
-        // exports just no-op rather than throwing.
+        // Run the patch's relocation thunks and constructors. Order matters:
+        //
+        // GLOBAL relocs must run before DATA relocs. `__wasm_apply_global_relocs` adjusts the
+        // `GOT.func.internal` globals (function references defined *inside* the patch) by
+        // `__table_base` — wasm-ld initializes them as element-segment-relative offsets.
+        // `__wasm_apply_data_relocs` then writes function pointers into the patch's data segment
+        // (e.g. trait-object vtables for patch-local closures) by reading those globals. If data
+        // relocs ran first it would store un-rebased, element-relative indices into the vtables,
+        // and the next `call_indirect` through such a vtable lands on an unrelated base-module
+        // function — a `function signature mismatch` trap. Ctors run last.
+        //
+        // `dyn_into` instead of `unchecked_into` so missing exports just no-op rather than throwing.
         for func_name in [
-            "__wasm_apply_data_relocs",
             "__wasm_apply_global_relocs",
+            "__wasm_apply_data_relocs",
             "__wasm_call_ctors",
         ] {
             if let Ok(val) = Reflect::get(&inst_exports, &func_name.into()) {
                 if let Ok(func) = val.dyn_into::<js_sys::Function>() {
                     _ = func.call0(&JsValue::undefined());
                 }
+            }
+        }
+
+        // Overwrite the old indirect-function-table slots with the freshly instantiated functions.
+        //
+        // The patch's vtables and function pointers (GOT.func) resolve to *old* table indices, so
+        // type-erased values created before the patch keep pointing at these slots. Redirecting the
+        // slots to the new functions makes their drop glue / trait methods dispatch into patched code
+        // instead of crashing on stale code. The CLI already filtered `ifunc_repoint` to pairs whose
+        // signatures match exactly, so overwriting is type-safe; new indices are rebased onto the
+        // grown table region just like `map` values above.
+        for &(old_idx, new_idx) in table.ifunc_repoint.iter() {
+            let new_slot = new_idx + table_base as u64;
+            if let Ok(func) = funcs.get(new_slot as u32) {
+                let _ = funcs.set(old_idx as u32, &func);
             }
         }
 
