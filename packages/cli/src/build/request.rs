@@ -2546,6 +2546,14 @@ impl BuildRequest {
     /// The idea of this folder is that we can run our top-level build command against it and we'll get
     /// a final build output somewhere. Some platforms have basically no build command, and can simply
     /// be ran by executing the exe directly.
+    /// Whether to keep the wasm `name` section in served base/patch binaries. Driven by the
+    /// `--keep-names` CLI flag or the `web.wasm_opt.keep_names` config. Default is to strip it (the
+    /// symbolicator resolves names from DWARF, not this section), but keeping it lets tools like
+    /// `console_error_panic_hook` print readable backtraces without a browser extension.
+    pub(crate) fn keep_wasm_names(&self) -> bool {
+        self.keep_names || self.config.web.wasm_opt.keep_names
+    }
+
     pub(crate) fn root_dir(&self) -> PathBuf {
         let platform_dir = self.platform_dir();
 

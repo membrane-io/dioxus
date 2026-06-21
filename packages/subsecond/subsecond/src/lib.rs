@@ -567,8 +567,43 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
             return;
         }
 
-        // Fetch + decode the patch wasm. Both awaits are pure I/O — they
-        // touch no shared state, so the future is safe to drop here.
+        // Reject patches built against a different base. On wasm a patch is just a set of indices
+        // into the shared function table, so applying one whose base has a different layout silently
+        // dispatches into the wrong functions (the "patch applied but old/garbage code runs" failure).
+        // The base exports `__subsecond_base_id`; if it disagrees with the id this patch was built
+        // against, skip applying and tell the user to reload. A missing id on either side (older CLI,
+        // or wasm-bindgen dropped the export) disables the check, preserving prior behavior.
+        if let Some(expected) = table.base_id {
+            let actual = Reflect::get(&exports, &"__subsecond_base_id".into())
+                .ok()
+                .and_then(|g| Reflect::get(&g, &"value".into()).ok())
+                .and_then(|v| v.as_f64())
+                .map(|f| f as i32);
+            if let Some(actual) = actual {
+                if actual != expected {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "[subsecond] skipping patch: built against base id {expected} but the \
+                             running base is {actual}. The page is running a stale base — do a full \
+                             reload to load the base this patch was built against."
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Coarse (ms-resolution) client-side timing of the patch apply, logged as one line at the
+        // end. Uses `Date::now` to avoid pulling the web-sys `Performance` feature; the stages here
+        // are tens-to-hundreds of ms so sub-ms precision isn't needed.
+        let t_start = js_sys::Date::now();
+
+        // Fetch headers, then stream-compile the body straight off the response —
+        // no intermediate ArrayBuffer. `compileStreaming` overlaps the download with
+        // compilation (V8 compiles on background threads as bytes arrive) and avoids
+        // allocating + copying the whole module into a JS buffer first. Both awaits are
+        // pure I/O — they touch no shared state, so the future is safe to drop here.
         let response: web_sys::Response =
             JsFuture::from(web_sys::window().unwrap_throw().fetch_with_str(&path))
                 .await
@@ -581,18 +616,38 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
                 response.status_text()
             );
         }
-        let dl_bytes: ArrayBuffer = JsFuture::from(response.array_buffer().unwrap())
-            .await
-            .unwrap()
-            .unchecked_into();
+        let t_fetched = js_sys::Date::now();
 
-        // Pre-compile. This is the slow part — V8 hands it to a worker —
-        // and yields the longest. The result is a Module with no side
-        // effects on host JS state, so cancelling here is also safe.
-        let module: Module = JsFuture::from(WebAssembly::compile(dl_bytes.unchecked_ref()))
-            .await
-            .unwrap()
-            .unchecked_into();
+        // We need the patch's byte length to size `memory.grow` below. Read it from
+        // Content-Length instead of materializing the body. The dev server serves the
+        // patch uncompressed, so this equals the instantiated size; it's also just a
+        // loose upper bound on the data segment we actually grow for. If the header is
+        // missing (e.g. a proxy switched to chunked transfer), fall back to buffering.
+        let content_len = response
+            .headers()
+            .get("content-length")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u32>().ok());
+        let (module, byte_len): (Module, u32) = if let Some(len) = content_len {
+            let source = js_sys::Promise::resolve(&response);
+            let module = JsFuture::from(WebAssembly::compile_streaming(source.unchecked_ref()))
+                .await
+                .unwrap()
+                .unchecked_into();
+            (module, len)
+        } else {
+            let buf: ArrayBuffer = JsFuture::from(response.array_buffer().unwrap())
+                .await
+                .unwrap()
+                .unchecked_into();
+            let module = JsFuture::from(WebAssembly::compile(buf.unchecked_ref()))
+                .await
+                .unwrap()
+                .unchecked_into();
+            (module, buf.byte_length())
+        };
+        let t_compiled = js_sys::Date::now();
 
         // ── HOST-STATE-MUTATING SECTION ───────────────────────────────
         //
@@ -620,7 +675,7 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
         //  * Cancellation between grow and `commit_patch` leaks memory
         //    pages and table slots, but doesn't corrupt anything.
         const PAGE_SIZE: u32 = 64 * 1024;
-        let patch_pages = (dl_bytes.byte_length() as f64 / PAGE_SIZE as f64).ceil() as u32 + 1;
+        let patch_pages = (byte_len as f64 / PAGE_SIZE as f64).ceil() as u32 + 1;
 
         // Use grow's return value (the prior page count) to derive
         // memory_base. Atomic w.r.t. concurrent grows, unlike reading
@@ -653,6 +708,101 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
         let imports = Object::new();
         Reflect::set(&imports, &"env".into(), &env).unwrap();
 
+        // Fast-path patches are served with their dynamic-linking imports intact (the CLI no longer
+        // rewrites the module, so its code section and DWARF stay byte-identical to the linker's
+        // output). We satisfy those imports here instead: `GOT.*` become imported globals, non-exported
+        // `env` functions are pulled from the shared indirect function table, `__wbindgen_placeholder__`
+        // resolves to the base's preserved `__saved_wbg_*` exports, and anything left over gets a
+        // trapping stub so instantiation can never fail with a LinkError.
+        if let Some(fixups) = table.wasm.as_ref() {
+            let make_i32_global = |value: i32, mutable: bool| -> JsValue {
+                let descriptor = Object::new();
+                Reflect::set(&descriptor, &"value".into(), &"i32".into()).unwrap();
+                Reflect::set(&descriptor, &"mutable".into(), &mutable.into()).unwrap();
+                WebAssembly::Global::new(&descriptor, &value.into())
+                    .unwrap()
+                    .into()
+            };
+
+            let got_func = Object::new();
+            for (name, idx) in fixups.got_func.iter() {
+                let g = make_i32_global(*idx, fixups.got_mutable);
+                Reflect::set(&got_func, &JsValue::from_str(name), &g).unwrap();
+            }
+            Reflect::set(&imports, &"GOT.func".into(), &got_func).unwrap();
+
+            let got_mem = Object::new();
+            for (name, offset) in fixups.got_mem.iter() {
+                let g = make_i32_global(*offset, fixups.got_mutable);
+                Reflect::set(&got_mem, &JsValue::from_str(name), &g).unwrap();
+            }
+            Reflect::set(&imports, &"GOT.mem".into(), &got_mem).unwrap();
+
+            for (name, idx) in fixups.env_ifunc.iter() {
+                if let Ok(func) = funcs.get(*idx as u32) {
+                    Reflect::set(&env, &JsValue::from_str(name), &func).unwrap();
+                }
+            }
+
+            // Completeness pass over the module's declared imports. Every import must be satisfied or
+            // `instantiate` throws a LinkError, so we wire the remaining function imports and stub the
+            // stragglers.
+            let stub: JsValue = js_sys::Function::new_no_args(
+                "throw new Error('subsecond: unsatisfied hot-patch import called')",
+            )
+            .into();
+            for entry in WebAssembly::Module::imports(&module).iter() {
+                let ns = Reflect::get(&entry, &"module".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                let name = Reflect::get(&entry, &"name".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                let kind = Reflect::get(&entry, &"kind".into())
+                    .ok()
+                    .and_then(|v| v.as_string());
+                let (Some(ns), Some(name), Some(kind)) = (ns, name, kind) else {
+                    continue;
+                };
+                if kind != "function" {
+                    continue;
+                }
+                let key = JsValue::from_str(&name);
+                match ns.as_str() {
+                    "env" => {
+                        let satisfied = Reflect::get(&env, &key)
+                            .map(|v| !v.is_undefined())
+                            .unwrap_or(false);
+                        if !satisfied {
+                            Reflect::set(&env, &key, &stub).unwrap();
+                        }
+                    }
+                    other => {
+                        // Lazily materialize the namespace object (e.g. __wbindgen_placeholder__).
+                        let ns_key = JsValue::from_str(other);
+                        let ns_obj: Object = match Reflect::get(&imports, &ns_key) {
+                            Ok(v) if v.is_object() => v.unchecked_into(),
+                            _ => {
+                                let o = Object::new();
+                                Reflect::set(&imports, &ns_key, &o).unwrap();
+                                o
+                            }
+                        };
+                        let value: JsValue = if other == "__wbindgen_placeholder__" {
+                            let saved = format!("__saved_wbg_{name}");
+                            Reflect::get(&exports, &JsValue::from_str(&saved))
+                                .ok()
+                                .filter(|v| !v.is_undefined())
+                                .unwrap_or_else(|| stub.clone())
+                        } else {
+                            stub.clone()
+                        };
+                        Reflect::set(&ns_obj, &key, &value).unwrap();
+                    }
+                }
+            }
+        }
+
         // Async instantiation of the precompiled module. This is the no-size-limit path; the
         // synchronous `new WebAssembly.Instance` constructor is capped at 8MB on Chrome's main
         // thread.
@@ -674,6 +824,7 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
                 .unchecked_into()
         };
         let inst_exports: Object = instance.exports();
+        let t_instantiated = js_sys::Date::now();
 
         // Run the patch's relocation thunks and constructors. Order matters:
         //
@@ -698,6 +849,7 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
                 }
             }
         }
+        let t_reloc = js_sys::Date::now();
 
         // Overwrite the old indirect-function-table slots with the freshly instantiated functions.
         //
@@ -707,11 +859,39 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
         // instead of crashing on stale code. The CLI already filtered `ifunc_repoint` to pairs whose
         // signatures match exactly, so overwriting is type-safe; new indices are rebased onto the
         // grown table region just like `map` values above.
+        let mut repoint_applied = 0usize;
         for &(old_idx, new_idx) in table.ifunc_repoint.iter() {
             let new_slot = new_idx + table_base as u64;
             if let Ok(func) = funcs.get(new_slot as u32) {
                 let _ = funcs.set(old_idx as u32, &func);
+                repoint_applied += 1;
             }
+        }
+        let t_done = js_sys::Date::now();
+
+        let name = path.rsplit('/').next().unwrap_or(path);
+        web_sys::console::log_1(
+            &format!(
+                "[subsecond] applied {} ({:.1} MB): headers={:.0}ms stream+compile={:.0}ms instantiate={:.0}ms reloc={:.0}ms repoint={:.0}ms total={:.0}ms | map={} repoint={}/{} table_base={}",
+                name,
+                byte_len as f64 / (1024.0 * 1024.0),
+                t_fetched - t_start,
+                t_compiled - t_fetched,
+                t_instantiated - t_compiled,
+                t_reloc - t_instantiated,
+                t_done - t_reloc,
+                t_done - t_start,
+                table.map.len(),
+                repoint_applied,
+                table.ifunc_repoint.len(),
+                table_base,
+            )
+            .into(),
+        );
+        if table.map.is_empty() {
+            web_sys::console::warn_1(
+                &"[subsecond] jump table map is EMPTY: patch instantiated but no functions are redirected, so old code keeps running. The running base likely doesn't match the base this patch was built against (try a full page reload).".into(),
+            );
         }
 
         unsafe { commit_patch(table) };
