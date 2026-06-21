@@ -1,10 +1,10 @@
 use anyhow::Context;
 use itertools::Itertools;
 use object::{
-    Endianness, Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
     macho::{self},
     read::File,
     write::{MachOBuildVersion, SectionId, StandardSection, Symbol, SymbolId, SymbolSection},
+    Endianness, Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::{
@@ -76,6 +76,11 @@ pub struct HotpatchModuleCache {
     pub old_bytes: Vec<u8>,
     pub old_exports: HashSet<String>,
     pub old_imports: HashSet<String>,
+
+    /// (wasm) Per-build identity read from the base's exported `__subsecond_base_id` global, copied
+    /// into every `JumpTable` so the runtime can reject patches built against a different base.
+    /// `None` if the base doesn't carry the global (older base, or wasm-bindgen dropped it).
+    pub base_id: Option<i32>,
 
     // ... native stuff
     pub symbol_table: HashMap<String, CachedSymbol>,
@@ -264,6 +269,8 @@ impl HotpatchModuleCache {
                     .map(|i| i.name.to_string())
                     .collect::<HashSet<_>>();
 
+                let base_id = read_exported_i32_global(&module, SUBSECOND_BASE_ID_EXPORT);
+
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
@@ -271,6 +278,7 @@ impl HotpatchModuleCache {
                     old_exports,
                     old_imports,
                     old_wasm: module,
+                    base_id,
                     ..Default::default()
                 }
             }
@@ -403,6 +411,8 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         aslr_reference,
         ifunc_count: 0,
         ifunc_repoint: Vec::new(),
+        wasm: None,
+        base_id: None,
     })
 }
 
@@ -455,6 +465,8 @@ pub fn create_native_jump_table(
         aslr_reference,
         ifunc_count: 0,
         ifunc_repoint: Vec::new(),
+        wasm: None,
+        base_id: None,
     })
 }
 
@@ -468,15 +480,285 @@ pub fn create_native_jump_table(
 /// - got.mem: data objects in the data segments
 ///
 /// It doesn't seem like we can compile the base module to export these, sadly, so we're going
+/// to satisfy them — but *where* we satisfy them is the whole performance story.
+///
+/// The historical approach (`create_wasm_jump_table_walrus`) rewrites the patch module to bake the
+/// GOT/env imports into local globals and `call_indirect` trampolines, then re-emits the whole module
+/// with walrus. That re-emit is the dominant cost of a hot patch (hundreds of ms) because walrus has
+/// to re-encode the code section and fix up DWARF to match the new function index space.
+///
+/// The fast path here avoids all of that: it leaves every dynamic-linking import in place (so the
+/// code section and its DWARF stay byte-identical to wasm-ld's output) and ships the values the
+/// runtime needs to satisfy those imports at instantiate time in the `JumpTable`. The only mutation
+/// to the served bytes is a cheap byte-level pass that strips custom sections, drops the start
+/// section, and adds the one export the runtime needs. We fall back to the walrus path only when the
+/// patch contains `wbg_cast` function *bodies* that must be rewritten — those are local functions, so
+/// the import object can't help and a real code-section edit is unavoidable.
+///
+/// <https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md>
+pub fn create_wasm_jump_table(
+    patch: &Path,
+    cache: &HotpatchModuleCache,
+    keep_names: bool,
+) -> Result<JumpTable> {
+    let t_start = std::time::Instant::now();
+    let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
+
+    // Parse once without DWARF — we only inspect imports/elements/types/names, never re-emit, so
+    // there's no reason to pay walrus's DWARF parse here.
+    let new = Module::from_buffer(&new_bytes)?;
+    let t_parsed = t_start.elapsed();
+
+    // wbg_cast bodies are local functions that point at `breaks_if_inline` no-ops and must be
+    // rewritten to `call_indirect` the original module's cast. An import object can't fix a local
+    // function body, so if any are present we have to take the walrus path that re-encodes the code.
+    let needs_body_rewrite = new.funcs.iter().any(|f| {
+        f.name.as_deref().is_some_and(|n| {
+            n.contains("wasm_bindgen4__rt8wbg_cast") && !n.contains("breaks_if_inline")
+        })
+    });
+    if needs_body_rewrite {
+        tracing::debug!("Patch needs wbg_cast body rewrite; using walrus jump-table path");
+        return create_wasm_jump_table_walrus(patch, cache, keep_names);
+    }
+
+    create_wasm_jump_table_fast(patch, &new_bytes, new, cache, t_start, t_parsed, keep_names)
+}
+
+/// Fast path: emit the patch with its dynamic-linking imports intact and hand the runtime the values
+/// it needs to satisfy them. See [`create_wasm_jump_table`] for why this is dramatically cheaper than
+/// the walrus round-trip.
+fn create_wasm_jump_table_fast(
+    patch: &Path,
+    new_bytes: &[u8],
+    new: Module,
+    cache: &HotpatchModuleCache,
+    t_start: std::time::Instant,
+    t_parsed: std::time::Duration,
+    keep_names: bool,
+) -> Result<JumpTable> {
+    use subsecond_types::WasmFixups;
+
+    let name_to_ifunc_old = &cache.symbol_ifunc_map;
+    let old = &cache.old_wasm;
+    let old_symbols =
+        parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
+    let old_sigs = collect_ifunc_signatures(old);
+
+    let mut got_func: Vec<(String, i32)> = Vec::new();
+    let mut got_mem: Vec<(String, i32)> = Vec::new();
+    let mut env_ifunc: Vec<(String, i32)> = Vec::new();
+    let mut got_mutable: Option<bool> = None;
+    let mut env_skipped_sig = 0usize;
+
+    for import in new.imports.iter() {
+        match import.module.as_str() {
+            "GOT.func" => {
+                let Some(entry) = name_to_ifunc_old.get(import.name.as_str()).cloned() else {
+                    return Err(PatchError::InvalidModule(format!(
+                        "Expected to find GOT.func entry in ifunc table: {}",
+                        import.name.as_str()
+                    )));
+                };
+                if let ImportKind::Global(gid) = import.kind {
+                    got_mutable.get_or_insert(new.globals.get(gid).mutable);
+                }
+                got_func.push((import.name.to_string(), entry));
+            }
+            "GOT.mem" => {
+                let ImportKind::Global(gid) = import.kind else {
+                    return Err(PatchError::InvalidModule(
+                        "Expected GOT.mem import to be a global".to_string(),
+                    ));
+                };
+                got_mutable.get_or_insert(new.globals.get(gid).mutable);
+                let offset = resolve_got_mem_offset(import.name.as_str(), &old_symbols, old)?;
+                got_mem.push((import.name.to_string(), offset));
+            }
+            "env" => {
+                let ImportKind::Function(func_id) = import.kind else {
+                    continue;
+                };
+                let name = import.name.as_str();
+                // Base-exported (or base-imported) functions are satisfied by the host exports the
+                // runtime already copies into `env`; nothing to ship for those.
+                if cache.old_exports.contains(name) || cache.old_imports.contains(name) {
+                    continue;
+                }
+                // Resolve through the shared ifunc table, but only when the signature matches the
+                // base slot. A name-matched-but-mismatched pair would fail instantiation with a
+                // LinkError; leaving it out makes the runtime install a trapping stub instead, which
+                // mirrors the old `call_indirect` behavior (it would only trap if actually called).
+                if let Some(&idx) = name_to_ifunc_old.get(name) {
+                    let ty = new.types.get(new.funcs.get(func_id).ty());
+                    let sig = (ty.params().to_vec(), ty.results().to_vec());
+                    if old_sigs.get(&idx) == Some(&sig) {
+                        env_ifunc.push((name.to_string(), idx));
+                    } else {
+                        env_skipped_sig += 1;
+                    }
+                }
+            }
+            // `__wbindgen_placeholder__` imports are resolved by the runtime from the base module's
+            // `__saved_wbg_*` exports (or a trapping stub), so we don't need to ship anything.
+            _ => {}
+        }
+    }
+
+    let n_got_func = got_func.len();
+    let n_got_mem = got_mem.len();
+    let n_env_ifunc = env_ifunc.len();
+
+    // Build the address map (old ifunc index → new ifunc index) and the in-place repoint set exactly
+    // as the walrus path does — these are pure analysis over the unmodified module.
+    let name_to_ifunc_new = collect_func_ifuncs(&new);
+    let ifunc_count = name_to_ifunc_new.len() as u64;
+    let mut map = AddressMap::default();
+    for (name, idx) in name_to_ifunc_new.iter() {
+        if let Some(old_idx) = name_to_ifunc_old.get(*name) {
+            map.insert(*old_idx as u64, *idx as u64);
+        }
+    }
+
+    let new_sigs = collect_ifunc_signatures(&new);
+    let mut ifunc_repoint = Vec::new();
+    for (&old_idx, &new_idx) in map.iter() {
+        if let (Some(old_sig), Some(new_sig)) = (
+            old_sigs.get(&(old_idx as i32)),
+            new_sigs.get(&(new_idx as i32)),
+        ) {
+            if old_sig == new_sig {
+                ifunc_repoint.push((old_idx, new_idx));
+            }
+        }
+    }
+    let t_analyzed = t_start.elapsed();
+
+    // Find the function index (in the *served* module's index space, which we don't change) of the
+    // global-relocs thunk so we can export it. wasm-ld refuses to export this synthetic function, but
+    // the runtime must call it. We read the index straight from the name section so it matches the
+    // real module layout — `Function::name` in walrus comes from that same section.
+    // wasm-ld only synthesizes `__wasm_apply_global_relocs` when the patch has `GOT.func.internal`
+    // globals to rebase by `__table_base`. When it's absent there's simply nothing to relocate, so a
+    // missing export is expected, not an error. When present we must export it (wasm-ld won't) so the
+    // runtime can call it.
+    let reloc_export = find_patch_func_index(new_bytes, "__wasm_apply_global_relocs");
+    if reloc_export.is_none() {
+        tracing::debug!(
+            "patch has no __wasm_apply_global_relocs (no internal global relocs needed)"
+        );
+    }
+
+    // Drop the walrus module before the byte pass — we're done analyzing and it holds a lot of memory.
+    drop(new);
+
+    // Produce the served bytes from the *original* linker output: strip custom sections we don't
+    // serve, drop the start section, and add the relocs export. The code/data/import sections are
+    // copied verbatim, so DWARF stays valid and there's no re-encode.
+    let lib = patch.to_path_buf();
+    let bytes = finalize_patch_wasm(new_bytes, reloc_export, keep_names)?;
+    std::fs::write(&lib, bytes)?;
+    let t_emitted = t_start.elapsed();
+
+    tracing::info!(
+        "Jump table (fast): parse={}ms analyze={}ms emit={}ms total={}ms | map={} repoint={} ifunc_count={ifunc_count} GOT.func={n_got_func} GOT.mem={n_got_mem} env_ifunc={n_env_ifunc} (sig-skipped {env_skipped_sig})",
+        t_parsed.as_millis(),
+        t_analyzed.saturating_sub(t_parsed).as_millis(),
+        t_emitted.saturating_sub(t_analyzed).as_millis(),
+        t_emitted.as_millis(),
+        map.len(),
+        ifunc_repoint.len(),
+    );
+
+    if map.is_empty() {
+        tracing::warn!(
+            "Jump table (fast): map is EMPTY — no old→new ifunc redirects, so the patch will apply but old code keeps running. \
+             This means the patch's defined-function names didn't intersect the base cache's symbol→ifunc map \
+             (e.g. the patch was read after its `name` section was stripped, or the running base doesn't match this cache)."
+        );
+    }
+
+    Ok(JumpTable {
+        map,
+        lib,
+        ifunc_count,
+        aslr_reference: 0,
+        new_base_address: 0,
+        ifunc_repoint,
+        wasm: Some(WasmFixups {
+            got_func,
+            got_mem,
+            env_ifunc,
+            got_mutable: got_mutable.unwrap_or(true),
+        }),
+        base_id: cache.base_id,
+    })
+}
+
+/// Resolve a `GOT.mem` import's value: the absolute offset of the named data symbol in the base
+/// module's linear memory. Factored out so both the fast path and the walrus path share it.
+fn resolve_got_mem_offset(
+    name: &str,
+    old_symbols: &RawDataSection<'_>,
+    old: &Module,
+) -> Result<i32> {
+    let data_symbol_idx = *old_symbols
+        .data_symbol_map
+        .get(name)
+        .with_context(|| format!("Failed to find GOT.mem import by its name: {name}"))?;
+    let data_symbol = old_symbols
+        .data_symbols
+        .get(&data_symbol_idx)
+        .context("Failed to find data symbol by its index")?;
+    let data = old
+        .data
+        .iter()
+        .nth(data_symbol.which_data_segment)
+        .context("Missing data segment in the main module")?;
+    let offset = match data.kind {
+        DataKind::Active {
+            offset: ConstExpr::Value(walrus::ir::Value::I32(idx)),
+            ..
+        } => idx,
+        DataKind::Active {
+            offset: ConstExpr::Value(walrus::ir::Value::I64(idx)),
+            ..
+        } => idx as i32,
+        _ => {
+            return Err(PatchError::InvalidModule(format!(
+                "Data segment of invalid table: {:?}",
+                data.kind
+            )));
+        }
+    };
+    Ok(offset + data_symbol.segment_offset as i32)
+}
+
+/// Walrus-based jump table generation (fallback path).
+///
+/// We need to line up the ifuncs from the main module to the ifuncs in the patch.
+///
+/// According to the dylink spec, there will be two sets of entries:
+///
+/// - got.func: functions in the indirect function table
+/// - got.mem: data objects in the data segments
+///
+/// It doesn't seem like we can compile the base module to export these, sadly, so we're going
 /// to manually satisfy them here, removing their need to be imported.
 ///
 /// <https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md>
-pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Result<JumpTable> {
+fn create_wasm_jump_table_walrus(
+    patch: &Path,
+    cache: &HotpatchModuleCache,
+    keep_names: bool,
+) -> Result<JumpTable> {
+    let t_start = std::time::Instant::now();
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
     let old = &cache.old_wasm;
     let old_symbols =
         parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
+    let t_read = t_start.elapsed();
 
     // Preserve DWARF custom sections through walrus so source-level stack traces
     // continue to resolve in hot-patched code. With the default `ModuleConfig`,
@@ -484,6 +766,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     let mut config = ModuleConfig::new();
     config.generate_dwarf(true);
     let mut new = Module::from_buffer_with_config(&new_bytes, &config)?;
+    let t_parsed = t_start.elapsed();
     let mut got_mems = vec![];
     let mut got_funcs = vec![];
     let mut wbg_funcs = vec![];
@@ -523,6 +806,11 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             m => tracing::trace!("Unknown import: {m}:{}", import.name),
         }
     }
+
+    let n_got_funcs = got_funcs.len();
+    let n_got_mems = got_mems.len();
+    let n_env_funcs = env_funcs.len();
+    let n_wbg_funcs = wbg_funcs.len();
 
     // We need to satisfy the GOT.func imports of this side module. The GOT imports come from the wasm-ld
     // implementation of the dynamic linking spec
@@ -709,10 +997,16 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
     // See the wbg_cast implementation in wasm-bindgen for more details:
     // <https://github.com/wasm-bindgen/wasm-bindgen/blob/f61a588f674304964a2062b2307edb304aed4d16/src/rt/mod.rs#L30>
     let new_func_ids = new.funcs.iter().map(|f| f.id()).collect::<Vec<_>>();
+    let mut wbg_cast_named = 0usize;
+    let mut wbg_cast_rewritten = 0usize;
     for func_id in new_func_ids {
         let Some(name) = new.funcs.get(func_id).name.as_deref() else {
             continue;
         };
+
+        if name.contains("wbg_cast") {
+            wbg_cast_named += 1;
+        }
 
         if name.contains("wasm_bindgen4__rt8wbg_cast") && !name.contains("breaks_if_inline") {
             let name = name.to_string();
@@ -722,8 +1016,13 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
                     .ok_or_else(|| anyhow::anyhow!("Could not find matching wbg_cast function for [{name}] - must generate new JS bindings."))?;
 
             convert_func_to_ifunc_call(&mut new, ifunc_table_initializer, func_id, old_idx, name);
+            wbg_cast_rewritten += 1;
         }
     }
+
+    tracing::info!(
+        "Patch edits: GOT.func={n_got_funcs} GOT.mem={n_got_mems} env_funcs={n_env_funcs} wbg_funcs={n_wbg_funcs} wbg_cast(named={wbg_cast_named}, rewritten={wbg_cast_rewritten})"
+    );
 
     // Wipe away the unnecessary sections
     let customs = new.customs.iter().map(|f| f.0).collect::<Vec<_>>();
@@ -753,13 +1052,16 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         new.exports.add(APPLY_RELOCS, func.id());
     }
 
+    let t_rewritten = t_start.elapsed();
+
     // Update the wasm module on the filesystem to use the newly lifted version.
     // Strip the wasm-ld linker sidecars (`linking` + `reloc.*`) from the emitted bytes -
     // the browser does not read them and they are commonly 30-50% of the patch size.
     let lib = patch.to_path_buf();
     let bytes = new.emit_wasm();
-    let bytes = strip_linker_sidecars(&bytes);
+    let bytes = strip_linker_sidecars(&bytes, keep_names);
     std::fs::write(&lib, bytes)?;
+    let t_emitted = t_start.elapsed();
 
     // And now assemble the jump table by mapping the old ifunc table to the new one, by name
     //
@@ -775,6 +1077,7 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             continue;
         }
     }
+    let t_mapped = t_start.elapsed();
 
     // Determine which old table slots are safe to overwrite in place with the patched function.
     //
@@ -801,6 +1104,27 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
             }
         }
     }
+    let t_repointed = t_start.elapsed();
+
+    tracing::info!(
+        "Jump table (walrus): read={}ms parse={}ms rewrite={}ms emit={}ms map={}ms repoint={}ms total={}ms | map={} repoint={} ifunc_count={ifunc_count}",
+        t_read.as_millis(),
+        t_parsed.saturating_sub(t_read).as_millis(),
+        t_rewritten.saturating_sub(t_parsed).as_millis(),
+        t_emitted.saturating_sub(t_rewritten).as_millis(),
+        t_mapped.saturating_sub(t_emitted).as_millis(),
+        t_repointed.saturating_sub(t_mapped).as_millis(),
+        t_repointed.as_millis(),
+        map.len(),
+        ifunc_repoint.len(),
+    );
+
+    if map.is_empty() {
+        tracing::warn!(
+            "Jump table (walrus): map is EMPTY — the patch will apply but old code keeps running \
+             (patch defined-function names didn't intersect the base cache's symbol→ifunc map)."
+        );
+    }
 
     Ok(JumpTable {
         map,
@@ -809,6 +1133,8 @@ pub fn create_wasm_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> Resu
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
+        wasm: None,
+        base_id: cache.base_id,
     })
 }
 
@@ -1170,7 +1496,7 @@ pub fn create_undefined_symbol_stub(
                             // Use JMP instruction to absolute address: FF 25 followed by 32-bit offset
                             // Then the 64-bit absolute address
                             let mut code = vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]; // jmp [rip+0]
-                            // Append the 64-bit address
+                                                                                     // Append the 64-bit address
                             code.extend_from_slice(&abs_addr.to_le_bytes());
                             code
                         }
@@ -1405,7 +1731,7 @@ fn collect_stub_symbols_from_bytes(
 /// custom sections, and copy every other section's bytes verbatim without parsing their
 /// payloads. Cost is ~one memcpy of the input. On a 200 MB wasm it runs in tens of ms,
 /// well below the threshold where it would slow a fat or patch build noticeably.
-pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
+pub fn strip_linker_sidecars(input: &[u8], keep_names: bool) -> Vec<u8> {
     if input.len() < 8 || &input[..4] != b"\0asm" {
         return input.to_vec();
     }
@@ -1433,7 +1759,7 @@ pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
                 let name_end = name_start + name_len as usize;
                 if name_end <= payload_end {
                     if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
-                        if should_strip_custom_section(name) {
+                        if should_strip_custom_section(name, keep_names) {
                             keep = false;
                         }
                     }
@@ -1449,6 +1775,172 @@ pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Resolve a function's index (in the module's function index space, imports first) by symbol name.
+///
+/// Prefers the wasm-ld `linking` section symbol table — these patches are linked with `--emit-relocs`
+/// so it's always present, and it's the same source walrus reads to populate `Function::name` (the
+/// modules carry no `name` custom section). Falls back to the `name` section for completeness.
+fn find_patch_func_index(bytes: &[u8], target: &str) -> Option<u32> {
+    if let Ok(section) = parse_bytes_to_data_segment(bytes) {
+        if let Some(&idx) = section.code_symbol_map.get(target) {
+            return Some(idx as u32);
+        }
+    }
+    find_wasm_func_index_by_name(bytes, target)
+}
+
+/// Find a function's index (in the module's function index space, imports first) by its `name`
+/// custom-section entry. That index space is exactly what an export entry must reference.
+fn find_wasm_func_index_by_name(bytes: &[u8], target: &str) -> Option<u32> {
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let Ok(Payload::CustomSection(s)) = payload else {
+            continue;
+        };
+        if s.name() != "name" {
+            continue;
+        }
+        let reader = wasmparser::NameSectionReader::new(BinaryReader::new(s.data(), 0));
+        for subsection in reader {
+            let Ok(wasmparser::Name::Function(map)) = subsection else {
+                continue;
+            };
+            for naming in map {
+                let Ok(naming) = naming else { continue };
+                if naming.name == target {
+                    return Some(naming.index);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Produce the bytes we serve for a fast-path patch directly from the raw linker output.
+///
+/// Three edits, all at the section/byte level so the code, data, and import sections — and the DWARF
+/// that indexes them — pass through untouched:
+///   1. strip the custom sections the browser never reads (see [`should_strip_custom_section`]),
+///   2. drop the start section (patch code must never auto-run; the runtime drives ctors/relocs), and
+///   3. export `__wasm_apply_global_relocs` so the runtime can call it (wasm-ld refuses to export it).
+///
+/// Cost is ~one memcpy of the input plus a re-encode of the (tiny) export section.
+fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool) -> Result<Vec<u8>> {
+    const SECTION_EXPORT: u8 = 7;
+    const SECTION_START: u8 = 8;
+
+    if input.len() < 8 || &input[..4] != b"\0asm" {
+        return Ok(input.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    out.extend_from_slice(&input[..8]); // magic + version
+
+    let mut pos = 8;
+    let mut export_emitted = false;
+    while pos < input.len() {
+        let section_start = pos;
+        let section_id = input[pos];
+        pos += 1;
+        let Some((section_size, leb_len)) = read_uleb128(&input[pos..]) else {
+            return Ok(input.to_vec());
+        };
+        pos += leb_len;
+        let payload_start = pos;
+        let payload_end = pos + section_size as usize;
+        if payload_end > input.len() {
+            return Ok(input.to_vec());
+        }
+        pos = payload_end;
+
+        // If the module had no export section (patches always do, but be safe), synthesize one right
+        // before the first ordered section that must follow it.
+        if !export_emitted && section_id != 0 && section_id > SECTION_EXPORT {
+            if let Some(idx) = reloc_export {
+                out.extend_from_slice(&encode_export_section(&[], idx));
+            }
+            export_emitted = true;
+        }
+
+        match section_id {
+            0 => {
+                let mut keep = true;
+                if let Some((name_len, name_leb)) = read_uleb128(&input[payload_start..]) {
+                    let name_start = payload_start + name_leb;
+                    let name_end = name_start + name_len as usize;
+                    if name_end <= payload_end {
+                        if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
+                            if should_strip_custom_section(name, keep_names) {
+                                keep = false;
+                            }
+                        }
+                    }
+                }
+                if keep {
+                    out.extend_from_slice(&input[section_start..payload_end]);
+                }
+            }
+            SECTION_START => { /* drop: never auto-run patch code */ }
+            SECTION_EXPORT => {
+                match reloc_export {
+                    Some(idx) => out.extend_from_slice(&encode_export_section(
+                        &input[payload_start..payload_end],
+                        idx,
+                    )),
+                    None => out.extend_from_slice(&input[section_start..payload_end]),
+                }
+                export_emitted = true;
+            }
+            _ => out.extend_from_slice(&input[section_start..payload_end]),
+        }
+    }
+
+    Ok(out)
+}
+
+/// Re-encode the export section, appending an `__wasm_apply_global_relocs` function export.
+///
+/// `existing_payload` is the original export section payload (`count` followed by the entries), or
+/// empty to synthesize a fresh section. Existing entries are copied verbatim; only the count and the
+/// one new entry are encoded.
+fn encode_export_section(existing_payload: &[u8], func_index: u32) -> Vec<u8> {
+    const NAME: &str = "__wasm_apply_global_relocs";
+
+    let (count, entries): (u32, &[u8]) = match read_uleb128(existing_payload) {
+        Some((c, l)) => (c, &existing_payload[l..]),
+        None => (0, &[]),
+    };
+
+    let mut new_entry = Vec::new();
+    write_uleb128(&mut new_entry, NAME.len() as u32);
+    new_entry.extend_from_slice(NAME.as_bytes());
+    new_entry.push(0x00); // export kind: function
+    write_uleb128(&mut new_entry, func_index);
+
+    let mut payload = Vec::new();
+    write_uleb128(&mut payload, count + 1);
+    payload.extend_from_slice(entries);
+    payload.extend_from_slice(&new_entry);
+
+    let mut section = vec![0x07u8]; // export section id
+    write_uleb128(&mut section, payload.len() as u32);
+    section.extend_from_slice(&payload);
+    section
+}
+
+fn write_uleb128(out: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
 /// Custom sections the served patch doesn't need, stripped to shrink the bytes the browser fetches
 /// and the runtime instantiates.
 ///
@@ -1460,12 +1952,20 @@ pub fn strip_linker_sidecars(input: &[u8]) -> Vec<u8> {
 /// symbolicator reads raw `0x` code offsets from the stack and resolves names from DWARF, never from
 /// this section — so it's pure weight, and the largest strippable one), and the DWARF
 /// accelerator/variable sections `addr2line` never reads for line/frame lookup.
-fn should_strip_custom_section(name: &str) -> bool {
+///
+/// `keep_names` (from the `--keep-names` CLI flag) preserves the `name` section: tools like
+/// `console_error_panic_hook` print human-readable backtraces from it without a browser extension,
+/// which is worth the extra bytes when profiling/debugging.
+fn should_strip_custom_section(name: &str, keep_names: bool) -> bool {
+    if name == "name" {
+        return !keep_names;
+    }
     name.starts_with("reloc.")
+        || name.contains("manganis")
+        || name.contains("__wasm_bindgen")
         || matches!(
             name,
             "linking"
-                | "name"
                 | "producers"
                 | "target_features"
                 | ".debug_aranges"
@@ -1685,7 +2185,50 @@ pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
+    // Embed a per-build identity the runtime can read back to detect a stale base. On wasm a patch
+    // is just a set of table indices; applying one built against a different base silently dispatches
+    // into the wrong functions. Exporting it as a global lets `subsecond` compare it against the
+    // patch's `JumpTable::base_id` and refuse the mismatch. The `HotpatchModuleCache` reads the same
+    // value back from the post-bindgen module, so both sides agree; if wasm-bindgen drops the export
+    // the cache reads `None` and the check goes inert (no false positives).
+    let base_id = base_build_id();
+    let gid = module.globals.add_local(
+        walrus::ValType::I32,
+        false,
+        false,
+        ConstExpr::Value(walrus::ir::Value::I32(base_id)),
+    );
+    module.exports.add(SUBSECOND_BASE_ID_EXPORT, gid);
+
     Ok(module.emit_wasm())
+}
+
+/// Name of the exported `i32` global that carries the base module's per-build identity.
+/// `subsecond` reads this at patch-apply time to reject patches built against a different base.
+const SUBSECOND_BASE_ID_EXPORT: &str = "__subsecond_base_id";
+
+/// A per-build identity for the base module. Just needs to differ across base rebuilds (including
+/// body-only changes that can still shuffle ifunc indices), so the low bits of the wall clock at
+/// build time suffice.
+fn base_build_id() -> i32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i32)
+        .unwrap_or(0)
+}
+
+/// Read the value of an exported, locally-defined `i32` global by export name. Returns `None` if the
+/// export is missing, isn't a global, or isn't an `i32` constant (e.g. wasm-bindgen rewrote it).
+fn read_exported_i32_global(module: &Module, export_name: &str) -> Option<i32> {
+    let export = module.exports.iter().find(|e| e.name == export_name)?;
+    let walrus::ExportItem::Global(gid) = export.item else {
+        return None;
+    };
+    match &module.globals.get(gid).kind {
+        walrus::GlobalKind::Local(ConstExpr::Value(walrus::ir::Value::I32(v))) => Some(*v),
+        _ => None,
+    }
 }
 
 /// Check if the name is a wasm-bindgen symbol
@@ -1777,14 +2320,18 @@ fn strip_linker_sidecars_bench() {
         }
     };
     let bytes = std::fs::read(&path).expect("read input wasm");
-    eprintln!("input size: {} bytes ({:.2} MB)", bytes.len(), bytes.len() as f64 / 1024.0 / 1024.0);
+    eprintln!(
+        "input size: {} bytes ({:.2} MB)",
+        bytes.len(),
+        bytes.len() as f64 / 1024.0 / 1024.0
+    );
 
     let runs = 5;
     let mut times_ms = Vec::with_capacity(runs);
     let mut last = Vec::new();
     for _ in 0..runs {
         let start = std::time::Instant::now();
-        last = strip_linker_sidecars(&bytes);
+        last = strip_linker_sidecars(&bytes, false);
         let elapsed = start.elapsed();
         times_ms.push(elapsed.as_secs_f64() * 1000.0);
     }
@@ -1828,6 +2375,125 @@ fn strip_linker_sidecars_bench() {
         std::fs::write(&out_path, &last).expect("write output wasm");
         eprintln!("wrote stripped wasm to {}", out_path);
     }
+}
+
+#[test]
+#[ignore]
+fn find_reloc_index_probe() {
+    let path = std::env::var("PROBE_WASM").expect("set PROBE_WASM=<path>");
+    let bytes = std::fs::read(&path).expect("read wasm");
+    eprintln!("custom sections present:");
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        if let Ok(Payload::CustomSection(s)) = payload {
+            eprintln!("  {} ({} bytes)", s.name(), s.data().len());
+        }
+    }
+    let by_name = find_wasm_func_index_by_name(&bytes, "__wasm_apply_global_relocs");
+    eprintln!("find_wasm_func_index_by_name -> {by_name:?}");
+    if let Ok(sec) = parse_bytes_to_data_segment(&bytes) {
+        let by_link = sec
+            .code_symbol_map
+            .get("__wasm_apply_global_relocs")
+            .copied();
+        eprintln!("linking code_symbol_map -> {by_link:?}");
+        eprintln!(
+            "linking code_symbol_map total funcs: {}",
+            sec.code_symbol_map.len()
+        );
+    } else {
+        eprintln!("no linking section");
+    }
+}
+
+#[test]
+fn finalize_patch_wasm_edits() {
+    use std::collections::HashSet;
+
+    fn section(id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut s = vec![id];
+        write_uleb128(&mut s, payload.len() as u32);
+        s.extend_from_slice(payload);
+        s
+    }
+    fn custom(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        write_uleb128(&mut p, name.len() as u32);
+        p.extend_from_slice(name.as_bytes());
+        p.extend_from_slice(data);
+        section(0, &p)
+    }
+
+    let mut m = Vec::new();
+    m.extend_from_slice(b"\0asm");
+    m.extend_from_slice(&1u32.to_le_bytes());
+    // type: () -> ()
+    m.extend_from_slice(&section(1, &[0x01, 0x60, 0x00, 0x00]));
+    // func: one function of type 0
+    m.extend_from_slice(&section(3, &[0x01, 0x00]));
+    // export: "main" -> func 0
+    let mut exp = Vec::new();
+    write_uleb128(&mut exp, 1);
+    write_uleb128(&mut exp, 4);
+    exp.extend_from_slice(b"main");
+    exp.push(0x00);
+    write_uleb128(&mut exp, 0);
+    m.extend_from_slice(&section(7, &exp));
+    // start: func 0 (must be dropped)
+    m.extend_from_slice(&section(8, &[0x00]));
+    // code: one empty body
+    let body = [0x00u8, 0x0b];
+    let mut code = Vec::new();
+    write_uleb128(&mut code, 1);
+    write_uleb128(&mut code, body.len() as u32);
+    code.extend_from_slice(&body);
+    m.extend_from_slice(&section(10, &code));
+    // customs: name + manganis stripped, .debug_info + dylink.0 kept
+    m.extend_from_slice(&custom("name", &[0x00]));
+    m.extend_from_slice(&custom(".debug_info", &[0x01, 0x02]));
+    m.extend_from_slice(&custom("manganis", &[0x03]));
+    m.extend_from_slice(&custom("dylink.0", &[0x04]));
+
+    let out = finalize_patch_wasm(&m, Some(0), false).unwrap();
+
+    let mut has_start = false;
+    let mut exports = HashSet::new();
+    let mut customs = HashSet::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&out) {
+        match payload.expect("finalized wasm must parse") {
+            Payload::StartSection { .. } => has_start = true,
+            Payload::ExportSection(r) => {
+                for e in r {
+                    exports.insert(e.unwrap().name.to_string());
+                }
+            }
+            Payload::CustomSection(s) => {
+                customs.insert(s.name().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(!has_start, "start section should be dropped");
+    assert!(exports.contains("main"), "existing exports preserved");
+    assert!(
+        exports.contains("__wasm_apply_global_relocs"),
+        "relocs export added"
+    );
+    assert!(!customs.contains("name"), "name section stripped");
+    assert!(!customs.contains("manganis"), "manganis stripped");
+    assert!(customs.contains(".debug_info"), "DWARF preserved");
+    assert!(customs.contains("dylink.0"), "dylink preserved");
+
+    // With keep_names, the `name` section survives while everything else is still stripped.
+    let kept = finalize_patch_wasm(&m, Some(0), true).unwrap();
+    let mut kept_customs = HashSet::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&kept) {
+        if let Payload::CustomSection(s) = payload.expect("finalized wasm must parse") {
+            kept_customs.insert(s.name().to_string());
+        }
+    }
+    assert!(kept_customs.contains("name"), "name section kept with --keep-names");
+    assert!(!kept_customs.contains("manganis"), "manganis still stripped");
 }
 
 /// Manually parse the data section from a wasm module

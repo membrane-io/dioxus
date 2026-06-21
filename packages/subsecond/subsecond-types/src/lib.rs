@@ -58,6 +58,54 @@ pub struct JumpTable {
     /// sites. New indices are pre-rebase (the runtime adds `__table_base`).
     #[serde(default)]
     pub ifunc_repoint: Vec<(u64, u64)>,
+
+    /// (wasm only) Values the runtime must supply for the patch's dynamic-linking imports at
+    /// instantiate time. When present, the CLI served the patch *without* rewriting it (no walrus
+    /// round-trip), leaving every `GOT.func` / `GOT.mem` / `env` / `__wbindgen_placeholder__` import
+    /// in place so the code section — and the DWARF that indexes it — stays byte-identical to the
+    /// linker's output. The runtime resolves these imports against the host's shared function table
+    /// and exports instead. `None` means the patch was self-satisfied the old way (walrus rewrite).
+    #[serde(default)]
+    pub wasm: Option<WasmFixups>,
+
+    /// (wasm only) Identity of the base module this patch was built against, read from the base's
+    /// exported `__subsecond_base_id` global. The runtime compares it against the running base's
+    /// value and refuses to apply the patch on a mismatch — a stale base (e.g. the page wasn't
+    /// reloaded after a full rebuild) has a different ifunc-table layout, so applying a patch built
+    /// against another base silently dispatches into the wrong functions. `None` disables the check
+    /// (older CLI, non-wasm, or wasm-bindgen dropped the export), preserving prior behavior.
+    #[serde(default)]
+    pub base_id: Option<i32>,
+}
+
+/// Host-supplied values for a side-module patch's dynamic-linking imports.
+///
+/// wasm-ld emits PIC side modules whose `GOT.*` / `env` / `__wbindgen_placeholder__` imports are
+/// meant to be filled in by a loader at instantiate time. Rather than mutating the module to bake
+/// these in (which forces a full walrus re-encode and invalidates DWARF), the CLI ships the raw
+/// values here and the runtime builds the import object. Anything not listed is resolved by the
+/// runtime itself: `env` functions from the host exports, `__wbindgen_placeholder__` from the base's
+/// `__saved_wbg_*` exports, and anything still missing gets a trapping stub so instantiation can't
+/// fail with a `LinkError`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct WasmFixups {
+    /// `GOT.func.<name>` → old indirect-function-table index. Supplied as an imported `i32` global.
+    pub got_func: Vec<(String, i32)>,
+
+    /// `GOT.mem.<name>` → absolute offset of the data symbol in the base module's linear memory.
+    /// Supplied as an imported `i32` global.
+    pub got_mem: Vec<(String, i32)>,
+
+    /// `env.<name>` function imports the base module doesn't export but that exist in the shared
+    /// indirect function table, paired with that table index. The runtime supplies the funcref via
+    /// `table.get(index)`. Only signature-matched entries are listed; mismatches are left to the
+    /// trapping-stub fallback (same observable behavior as the old `call_indirect` path: traps only
+    /// if actually called).
+    pub env_ifunc: Vec<(String, i32)>,
+
+    /// Whether the `GOT.*` imported globals are declared mutable (wasm-ld emits them mutable). The
+    /// supplied `WebAssembly.Global` must match or instantiation fails with a `LinkError`.
+    pub got_mutable: bool,
 }
 
 /// An address to address hashmap that does not hash addresses since addresses are by definition unique.
