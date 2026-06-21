@@ -134,6 +134,17 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
             // Received a message from the devtools server - currently we only use this for
             // logging, so we just forward it the tui
             ServeUpdate::WsMessage { msg, bundle } => {
+                if let axum::extract::ws::Message::Text(text) = &msg
+                    && let Ok(dioxus_devtools_types::ClientMsg::FullRebuild) =
+                        serde_json::from_str::<dioxus_devtools_types::ClientMsg>(text.as_str())
+                {
+                    tracing::info!("Full rebuild: triggered by client");
+                    builder.full_rebuild().await;
+                    devserver.send_reload_start().await;
+                    devserver.start_build().await;
+                    continue;
+                }
+
                 screen.push_ws_message(bundle, &msg);
             }
 

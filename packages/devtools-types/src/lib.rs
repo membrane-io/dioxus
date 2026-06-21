@@ -37,6 +37,9 @@ pub enum ClientMsg {
         level: String,
         messages: Vec<String>,
     },
+    /// Ask the devserver to do a full rebuild — equivalent to pressing `r` in the TUI.
+    /// Useful when a hot-patch leaves the running app in an unrecoverable state.
+    FullRebuild,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
