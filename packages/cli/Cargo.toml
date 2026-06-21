@@ -175,6 +175,9 @@ clap_complete = { version = "4.5.65", features = ["unstable-dynamic"] }
 [target.'cfg(target_env = "musl")'.dependencies]
 git2 = { version = "0.21.0", features = ["vendored-libgit2"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [features]
 default = []
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]

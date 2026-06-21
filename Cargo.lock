@@ -3278,6 +3278,7 @@ dependencies = [
  "indoc",
  "itertools 0.14.0",
  "krates",
+ "libc",
  "lightningcss",
  "log",
  "manganis",
