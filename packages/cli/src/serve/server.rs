@@ -33,7 +33,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     path::Path,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use subsecond_types::JumpTable;
 use tokio::process::Command;
@@ -625,6 +625,54 @@ fn build_serve_dir(runner: &AppServer) -> axum::routing::MethodRouter {
             format!("Unhandled internal error: {error}"),
         )
     })
+    .layer(middleware::from_fn(time_wasm_requests))
+}
+
+/// Logs one line per served `.wasm` file (notably hot-patch modules) reporting how long the request
+/// took, measured from request receipt until the response body has finished streaming. Useful for
+/// telling apart "the patch was slow to build" from "the patch was slow to fetch". Shown at info
+/// level so it appears without verbose mode.
+async fn time_wasm_requests(req: Request, next: Next) -> Response<Body> {
+    let path = req.uri().path().to_string();
+    if !path.ends_with(".wasm") {
+        return next.run(req).await;
+    }
+
+    let filename = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+    let start = Instant::now();
+    let (parts, body) = next.run(req).await.into_parts();
+    let status = parts.status;
+
+    // Logs on drop — i.e. when the body stream is dropped after hyper finishes sending it (or the
+    // client disconnects), so the duration spans the full transfer rather than just time-to-headers.
+    struct LogOnEnd {
+        start: Instant,
+        filename: String,
+        status: StatusCode,
+    }
+    impl Drop for LogOnEnd {
+        fn drop(&mut self) {
+            tracing::info!(
+                dx_src = ?TraceSrc::Dev,
+                "Served {} ({}) in {:.1?}",
+                self.filename,
+                self.status.as_u16(),
+                self.start.elapsed()
+            );
+        }
+    }
+
+    let guard = LogOnEnd {
+        start,
+        filename,
+        status,
+    };
+    let stream = body.into_data_stream().inspect(move |_| {
+        // Keep the guard alive for the lifetime of the body stream; it logs when the stream ends.
+        let _ = &guard;
+    });
+
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 fn no_cache(
