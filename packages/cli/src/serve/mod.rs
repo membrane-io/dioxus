@@ -119,12 +119,12 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 pid,
             } => {
                 devserver
-                    .send_hotreload(builder.applied_hot_reload_changes(BuildId::PRIMARY))
+                    .send_hotreload_to_new(builder.applied_hot_reload_changes(BuildId::PRIMARY))
                     .await;
 
                 if builder.server.is_some() {
                     devserver
-                        .send_hotreload(builder.applied_hot_reload_changes(BuildId::SECONDARY))
+                        .send_hotreload_to_new(builder.applied_hot_reload_changes(BuildId::SECONDARY))
                         .await;
                 }
 
