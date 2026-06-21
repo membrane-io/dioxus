@@ -1026,10 +1026,11 @@ impl Output {
 
                     formatted_line.push_span(
                         Span::raw(format!(
-                            "{:02}:{:02}:{:02} ",
+                            "{:02}:{:02}:{:02}.{:03} ",
                             log.timestamp.hour(),
                             log.timestamp.minute(),
-                            log.timestamp.second()
+                            log.timestamp.second(),
+                            log.timestamp.timestamp_subsec_millis()
                         ))
                         .dark_gray(),
                     );
