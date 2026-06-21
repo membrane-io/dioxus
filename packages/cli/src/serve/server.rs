@@ -298,6 +298,27 @@ impl WebServer {
         }
     }
 
+    /// Send the accumulated hot-reload state to only the socket that just
+    /// connected (the last one pushed, see `wait`). This is the catch-up for a
+    /// fresh client. Broadcasting it instead — as `send_hotreload` does — makes
+    /// every already-current client re-apply the last patch, re-instantiating it
+    /// and leaking the linear-memory + function-table growth on each duplicate.
+    pub(crate) async fn send_hotreload_to_new(&mut self, reload: HotReloadMsg) {
+        if reload.is_empty() {
+            return;
+        }
+
+        let msg = DevserverMsg::HotReload(reload);
+        let msg = serde_json::to_string(&msg).unwrap();
+
+        let Some(socket) = self.hot_reload_sockets.last_mut() else {
+            return;
+        };
+        if socket.socket.send(Message::Text(msg.into())).await.is_err() {
+            self.hot_reload_sockets.pop();
+        }
+    }
+
     pub(crate) async fn send_patch(
         &mut self,
         jump_table: JumpTable,
