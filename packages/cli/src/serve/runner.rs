@@ -471,6 +471,19 @@ impl AppServer {
                     continue;
                 };
 
+                // A thin hotpatch only recompiles/replays workspace crates. If this file belongs to a
+                // non-workspace path dependency (common when such a crate is vendored inside the
+                // workspace folder), a code change here can't be reflected by a patch — only a full
+                // rebuild picks it up. We detect that here so the recompile-triggering branches below can
+                // skip producing a useless patch. When the build is in a `Failed` state we leave this as
+                // `None` so the change still drives the (fat) recovery rebuild, which does recompile the
+                // dependency. rsx/template-only changes are still hot-reloaded regardless of crate.
+                let non_workspace_crate = if self.client.stage == BuildStage::Failed {
+                    None
+                } else {
+                    self.file_in_non_workspace_crate(path)
+                };
+
                 // Get the cached file if it exists - ignoring if it doesn't exist
                 let Some(cached_file) = self.file_map.get_mut(path) else {
                     tracing::debug!("No entry for file in filemap: {:?}", path);
@@ -499,6 +512,14 @@ impl AppServer {
 
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
                 let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
+                    if let Some(krate) = &non_workspace_crate {
+                        tracing::info!(
+                            dx_src = ?TraceSrc::Dev,
+                            "Skipping hotpatch: change in non-workspace crate '{krate}' can't be patched — run a full rebuild to apply it ({})",
+                            local_path.display()
+                        );
+                        continue;
+                    }
                     needs_rust_rebuild = true;
                     break;
                 };
@@ -528,6 +549,14 @@ impl AppServer {
 
                     // If no result is returned, we can't hotreload this file and need to keep the old file
                     let Some(results) = results else {
+                        if let Some(krate) = &non_workspace_crate {
+                            tracing::info!(
+                                dx_src = ?TraceSrc::Dev,
+                                "Skipping hotpatch: change in non-workspace crate '{krate}' can't be patched — run a full rebuild to apply it ({})",
+                                local_path.display()
+                            );
+                            break;
+                        }
                         needs_rust_rebuild = true;
                         break;
                     };
@@ -1508,6 +1537,54 @@ impl AppServer {
         }
 
         best_match.map(|(name, _)| name)
+    }
+
+    /// If `file` is owned by a crate in the dependency graph that is *not* a workspace member,
+    /// return that crate's name (rustc convention: hyphens → underscores). Otherwise `None`.
+    ///
+    /// The owning crate is the one whose manifest directory is the longest path-prefix of `file`,
+    /// considering *all* crates (not just workspace members). This correctly attributes a file that
+    /// lives in a non-workspace path dependency nested inside the workspace directory (e.g. a vendored
+    /// `egui/`), which `file_to_workspace_crate` would otherwise misattribute to the enclosing
+    /// workspace-root crate.
+    ///
+    /// A thin hotpatch only recompiles/replays workspace crates, so a source change to a
+    /// non-workspace crate can't be reflected by a patch — it needs a full rebuild. Callers use this
+    /// to skip producing a useless patch for such changes.
+    fn file_in_non_workspace_crate(&self, file: &Path) -> Option<String> {
+        let member_dirs: HashSet<PathBuf> = self
+            .workspace
+            .krates
+            .workspace_members()
+            .filter_map(|node| match node {
+                krates::Node::Krate { krate, .. } => krate
+                    .manifest_path
+                    .parent()
+                    .map(|p| p.as_std_path().to_path_buf()),
+                _ => None,
+            })
+            .collect();
+
+        let mut best: Option<(String, PathBuf, usize)> = None;
+        for krate in self.workspace.krates.krates() {
+            let Some(crate_dir) = krate.manifest_path.parent() else {
+                continue;
+            };
+            let crate_dir = crate_dir.as_std_path();
+            if file.starts_with(crate_dir) {
+                let depth = crate_dir.components().count();
+                if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
+                    best = Some((krate.name.replace('-', "_"), crate_dir.to_path_buf(), depth));
+                }
+            }
+        }
+
+        let (name, crate_dir, _) = best?;
+        if member_dirs.contains(&crate_dir) {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     /// Check if this is a fullstack build. This means that there is an additional build with the `server` platform.
