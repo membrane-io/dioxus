@@ -599,6 +599,21 @@ impl BuildRequest {
             cmd.arg("-Crelocation-model=pic");
         }
 
+        // Lower each replay compiler's OS scheduling priority so the dx process keeps enough CPU to
+        // render the TUI and, crucially, drain this child's stdout/stderr. A wide replay level runs
+        // several rustc concurrently — each already multi-threaded via `-Zthreads`/`codegen-units` —
+        // which can saturate every core and starve dx's pipe-draining task. rustc emits a large
+        // (JSON) diagnostic stream; once the pipe buffer fills it blocks on write, stalling the
+        // build. Deprioritizing the compilers lets dx win enough scheduling to keep the pipes
+        // flowing. Best-effort and Unix-only; a failed `setpriority` is harmless.
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS as _, 0, 10);
+                Ok(())
+            });
+        }
+
         // Stream stdout/stderr and collect diagnostics/text lines. The captured rustc args
         // include `--error-format=json-*`, so each diagnostic arrives as a single JSON line that
         // parses into a `Diagnostic` with a pre-rendered string attached.
