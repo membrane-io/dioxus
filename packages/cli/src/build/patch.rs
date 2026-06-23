@@ -77,6 +77,14 @@ pub struct HotpatchModuleCache {
     pub old_exports: HashSet<String>,
     pub old_imports: HashSet<String>,
 
+    /// (wasm) Base data-symbol name → absolute linear-memory offset. Precomputed once so the fast
+    /// path can satisfy `GOT.mem` imports without re-parsing the base data section every patch.
+    pub data_symbol_offsets: HashMap<String, i32>,
+
+    /// (wasm) Base ifunc-table index → normalized signature. Precomputed once so the fast path can
+    /// gate `env` imports and in-place repoints without re-deriving base signatures every patch.
+    pub ifunc_sigs: HashMap<i32, SigVec>,
+
     /// (wasm) Per-build identity read from the base's exported `__subsecond_base_id` global, copied
     /// into every `JumpTable` so the runtime can reject patches built against a different base.
     /// `None` if the base doesn't carry the global (older base, or wasm-bindgen dropped it).
@@ -271,6 +279,29 @@ impl HotpatchModuleCache {
 
                 let base_id = read_exported_i32_global(&module, SUBSECOND_BASE_ID_EXPORT);
 
+                // Precompute the base-only inputs the fast path needs per patch, so it never has to
+                // re-parse the base data section or re-derive base signatures.
+                let data_symbol_offsets = symbols
+                    .data_symbol_map
+                    .keys()
+                    .filter_map(|name| {
+                        let offset = resolve_got_mem_offset(name, &symbols, &module).ok()?;
+                        Some((name.to_string(), offset))
+                    })
+                    .collect();
+                let ifunc_sigs = collect_ifunc_signatures(&module)
+                    .into_iter()
+                    .map(|(idx, (params, results))| {
+                        (
+                            idx,
+                            (
+                                params.iter().map(walrus_valtype_sig).collect(),
+                                results.iter().map(walrus_valtype_sig).collect(),
+                            ),
+                        )
+                    })
+                    .collect();
+
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
                     old_bytes: bytes,
@@ -279,6 +310,8 @@ impl HotpatchModuleCache {
                     old_imports,
                     old_wasm: module,
                     base_id,
+                    data_symbol_offsets,
+                    ifunc_sigs,
                     ..Default::default()
                 }
             }
@@ -504,25 +537,230 @@ pub fn create_wasm_jump_table(
     let t_start = std::time::Instant::now();
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
 
-    // Parse once without DWARF — we only inspect imports/elements/types/names, never re-emit, so
-    // there's no reason to pay walrus's DWARF parse here.
-    let new = Module::from_buffer(&new_bytes)?;
+    // Analyze the patch with a single `wasmparser` pass that skips the code section. The fast path
+    // never re-emits the module, so we only need the import/type/function/element/name sections —
+    // decoding ~30 MB of function bodies into walrus IR (what `Module::from_buffer` does) is pure
+    // overhead here and was the bulk of the old "parse" cost.
+    let analysis = analyze_patch_wasm(&new_bytes)?;
     let t_parsed = t_start.elapsed();
 
     // wbg_cast bodies are local functions that point at `breaks_if_inline` no-ops and must be
     // rewritten to `call_indirect` the original module's cast. An import object can't fix a local
     // function body, so if any are present we have to take the walrus path that re-encodes the code.
-    let needs_body_rewrite = new.funcs.iter().any(|f| {
-        f.name.as_deref().is_some_and(|n| {
-            n.contains("wasm_bindgen4__rt8wbg_cast") && !n.contains("breaks_if_inline")
-        })
-    });
-    if needs_body_rewrite {
+    if analysis.needs_body_rewrite {
         tracing::debug!("Patch needs wbg_cast body rewrite; using walrus jump-table path");
         return create_wasm_jump_table_walrus(patch, cache, keep_names);
     }
 
-    create_wasm_jump_table_fast(patch, &new_bytes, new, cache, t_start, t_parsed, keep_names)
+    create_wasm_jump_table_fast(patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names)
+}
+
+/// A normalized wasm value type, comparable across the `walrus` (base/cache) and `wasmparser`
+/// (patch) parsers so signatures from both can be checked for equality.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum WasmSig {
+    I32,
+    I64,
+    F32,
+    F64,
+    V128,
+    FuncRef,
+    ExternRef,
+    OtherRef,
+}
+
+pub type SigVec = (Vec<WasmSig>, Vec<WasmSig>);
+
+fn walrus_valtype_sig(t: &ValType) -> WasmSig {
+    match t {
+        ValType::I32 => WasmSig::I32,
+        ValType::I64 => WasmSig::I64,
+        ValType::F32 => WasmSig::F32,
+        ValType::F64 => WasmSig::F64,
+        ValType::V128 => WasmSig::V128,
+        ValType::Ref(walrus::RefType::Funcref) => WasmSig::FuncRef,
+        ValType::Ref(walrus::RefType::Externref) => WasmSig::ExternRef,
+        ValType::Ref(_) => WasmSig::OtherRef,
+    }
+}
+
+fn wasmparser_valtype_sig(t: wasmparser::ValType) -> WasmSig {
+    match t {
+        wasmparser::ValType::I32 => WasmSig::I32,
+        wasmparser::ValType::I64 => WasmSig::I64,
+        wasmparser::ValType::F32 => WasmSig::F32,
+        wasmparser::ValType::F64 => WasmSig::F64,
+        wasmparser::ValType::V128 => WasmSig::V128,
+        wasmparser::ValType::Ref(r) if r == wasmparser::RefType::FUNCREF => WasmSig::FuncRef,
+        wasmparser::ValType::Ref(r) if r == wasmparser::RefType::EXTERNREF => WasmSig::ExternRef,
+        wasmparser::ValType::Ref(_) => WasmSig::OtherRef,
+    }
+}
+
+/// Everything the fast path needs from the patch module, extracted in one `wasmparser` pass that
+/// never decodes function bodies.
+struct PatchWasmAnalysis {
+    /// `GOT.func.<name>` import names, in module order.
+    got_func: Vec<String>,
+    /// `GOT.mem.<name>` import names, in module order.
+    got_mem: Vec<String>,
+    /// Mutability of the `GOT.*` imported globals (wasm-ld emits them mutable). `None` if there are
+    /// no GOT imports at all.
+    got_mutable: Option<bool>,
+    /// `env.<name>` function imports paired with their signature.
+    env_funcs: Vec<(String, SigVec)>,
+    /// Function name → ifunc-table index, from the active element segments.
+    name_to_ifunc: HashMap<String, i32>,
+    /// ifunc-table index → signature.
+    ifunc_sigs: HashMap<i32, SigVec>,
+    /// True when a `wbg_cast` function *body* is present and must be rewritten (forces walrus path).
+    needs_body_rewrite: bool,
+}
+
+/// Parse the patch with `wasmparser`, reading only the sections the fast path needs and skipping the
+/// (huge) code section. This is the replacement for `walrus::Module::from_buffer` in the fast path.
+fn analyze_patch_wasm(bytes: &[u8]) -> Result<PatchWasmAnalysis> {
+    // Type index → signature.
+    let mut types: Vec<SigVec> = Vec::new();
+    // Function index (imports first, then defined) → type index.
+    let mut func_type_idx: Vec<u32> = Vec::new();
+    let mut got_func: Vec<String> = Vec::new();
+    let mut got_mem: Vec<String> = Vec::new();
+    let mut got_mutable: Option<bool> = None;
+    // (name, type index) — resolved to a signature after the full pass.
+    let mut env_func_imports: Vec<(String, u32)> = Vec::new();
+    // (base offset, function indices) — resolved to names/signatures after the full pass.
+    let mut elements: Vec<(i32, Vec<u32>)> = Vec::new();
+    let mut func_names: HashMap<u32, String> = HashMap::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::TypeSection(reader) => {
+                for rec_group in reader {
+                    for sub in rec_group?.into_types() {
+                        match sub.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(ft) => {
+                                let params =
+                                    ft.params().iter().copied().map(wasmparser_valtype_sig).collect();
+                                let results = ft
+                                    .results()
+                                    .iter()
+                                    .copied()
+                                    .map(wasmparser_valtype_sig)
+                                    .collect();
+                                types.push((params, results));
+                            }
+                            // Non-function types still consume a type index; push a placeholder so
+                            // later type-index lookups stay aligned. They're never used as a func sig.
+                            _ => types.push((Vec::new(), Vec::new())),
+                        }
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import?;
+                    match import.ty {
+                        wasmparser::TypeRef::Func(tyidx) => {
+                            func_type_idx.push(tyidx);
+                            if import.module == "env" {
+                                env_func_imports.push((import.name.to_string(), tyidx));
+                            }
+                        }
+                        wasmparser::TypeRef::Global(gt) => match import.module {
+                            "GOT.func" => {
+                                got_func.push(import.name.to_string());
+                                got_mutable.get_or_insert(gt.mutable);
+                            }
+                            "GOT.mem" => {
+                                got_mem.push(import.name.to_string());
+                                got_mutable.get_or_insert(gt.mutable);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for tyidx in reader {
+                    func_type_idx.push(tyidx?);
+                }
+            }
+            Payload::ElementSection(reader) => {
+                for element in reader {
+                    let element = element?;
+                    let offset = match &element.kind {
+                        wasmparser::ElementKind::Active { offset_expr, .. } => {
+                            match offset_expr.get_operators_reader().read()? {
+                                wasmparser::Operator::I32Const { value } => value,
+                                wasmparser::Operator::I64Const { value } => value as i32,
+                                // The ifunc table is offset by an imported global, so the explicit
+                                // offset contribution is 0 (matches the walrus path).
+                                wasmparser::Operator::GlobalGet { .. } => 0,
+                                _ => continue,
+                            }
+                        }
+                        _ => continue,
+                    };
+                    if let wasmparser::ElementItems::Functions(funcs) = element.items {
+                        let ids = funcs
+                            .into_iter()
+                            .collect::<std::result::Result<Vec<u32>, _>>()?;
+                        elements.push((offset, ids));
+                    }
+                }
+            }
+            Payload::CustomSection(section) if section.name() == "name" => {
+                let reader = wasmparser::NameSectionReader::new(BinaryReader::new(section.data(), 0));
+                for subsection in reader {
+                    let Ok(wasmparser::Name::Function(map)) = subsection else {
+                        continue;
+                    };
+                    for naming in map {
+                        let naming = naming?;
+                        func_names.insert(naming.index, naming.name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let env_funcs = env_func_imports
+        .into_iter()
+        .map(|(name, tyidx)| (name, types.get(tyidx as usize).cloned().unwrap_or_default()))
+        .collect();
+
+    let mut name_to_ifunc = HashMap::new();
+    let mut ifunc_sigs = HashMap::new();
+    for (offset, ids) in &elements {
+        for (i, &func_idx) in ids.iter().enumerate() {
+            let ifunc_idx = offset + i as i32;
+            if let Some(name) = func_names.get(&func_idx) {
+                name_to_ifunc.insert(name.clone(), ifunc_idx);
+            }
+            if let Some(&tyidx) = func_type_idx.get(func_idx as usize) {
+                if let Some(sig) = types.get(tyidx as usize) {
+                    ifunc_sigs.insert(ifunc_idx, sig.clone());
+                }
+            }
+        }
+    }
+
+    let needs_body_rewrite = func_names
+        .values()
+        .any(|n| n.contains("wasm_bindgen4__rt8wbg_cast") && !n.contains("breaks_if_inline"));
+
+    Ok(PatchWasmAnalysis {
+        got_func,
+        got_mem,
+        got_mutable,
+        env_funcs,
+        name_to_ifunc,
+        ifunc_sigs,
+        needs_body_rewrite,
+    })
 }
 
 /// Fast path: emit the patch with its dynamic-linking imports intact and hand the runtime the values
@@ -531,7 +769,7 @@ pub fn create_wasm_jump_table(
 fn create_wasm_jump_table_fast(
     patch: &Path,
     new_bytes: &[u8],
-    new: Module,
+    analysis: PatchWasmAnalysis,
     cache: &HotpatchModuleCache,
     t_start: std::time::Instant,
     t_parsed: std::time::Duration,
@@ -540,92 +778,71 @@ fn create_wasm_jump_table_fast(
     use subsecond_types::WasmFixups;
 
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
-    let old = &cache.old_wasm;
-    let old_symbols =
-        parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
-    let old_sigs = collect_ifunc_signatures(old);
+    // Base-derived signatures, precomputed at cache-build time (normalized for cross-parser
+    // comparison against the patch's wasmparser-derived signatures).
+    let old_sigs = &cache.ifunc_sigs;
 
     let mut got_func: Vec<(String, i32)> = Vec::new();
     let mut got_mem: Vec<(String, i32)> = Vec::new();
     let mut env_ifunc: Vec<(String, i32)> = Vec::new();
-    let mut got_mutable: Option<bool> = None;
     let mut env_skipped_sig = 0usize;
 
-    for import in new.imports.iter() {
-        match import.module.as_str() {
-            "GOT.func" => {
-                let Some(entry) = name_to_ifunc_old.get(import.name.as_str()).cloned() else {
-                    return Err(PatchError::InvalidModule(format!(
-                        "Expected to find GOT.func entry in ifunc table: {}",
-                        import.name.as_str()
-                    )));
-                };
-                if let ImportKind::Global(gid) = import.kind {
-                    got_mutable.get_or_insert(new.globals.get(gid).mutable);
-                }
-                got_func.push((import.name.to_string(), entry));
+    for name in &analysis.got_func {
+        let Some(entry) = name_to_ifunc_old.get(name.as_str()).cloned() else {
+            return Err(PatchError::InvalidModule(format!(
+                "Expected to find GOT.func entry in ifunc table: {name}"
+            )));
+        };
+        got_func.push((name.clone(), entry));
+    }
+
+    for name in &analysis.got_mem {
+        let offset = *cache
+            .data_symbol_offsets
+            .get(name)
+            .with_context(|| format!("Failed to find GOT.mem import by its name: {name}"))?;
+        got_mem.push((name.clone(), offset));
+    }
+
+    for (name, sig) in &analysis.env_funcs {
+        // Base-exported (or base-imported) functions are satisfied by the host exports the runtime
+        // already copies into `env`; nothing to ship for those.
+        if cache.old_exports.contains(name) || cache.old_imports.contains(name) {
+            continue;
+        }
+        // Resolve through the shared ifunc table, but only when the signature matches the base slot.
+        // A name-matched-but-mismatched pair would fail instantiation with a LinkError; leaving it
+        // out makes the runtime install a trapping stub instead, which mirrors the old
+        // `call_indirect` behavior (it would only trap if actually called).
+        if let Some(&idx) = name_to_ifunc_old.get(name.as_str()) {
+            if old_sigs.get(&idx) == Some(sig) {
+                env_ifunc.push((name.clone(), idx));
+            } else {
+                env_skipped_sig += 1;
             }
-            "GOT.mem" => {
-                let ImportKind::Global(gid) = import.kind else {
-                    return Err(PatchError::InvalidModule(
-                        "Expected GOT.mem import to be a global".to_string(),
-                    ));
-                };
-                got_mutable.get_or_insert(new.globals.get(gid).mutable);
-                let offset = resolve_got_mem_offset(import.name.as_str(), &old_symbols, old)?;
-                got_mem.push((import.name.to_string(), offset));
-            }
-            "env" => {
-                let ImportKind::Function(func_id) = import.kind else {
-                    continue;
-                };
-                let name = import.name.as_str();
-                // Base-exported (or base-imported) functions are satisfied by the host exports the
-                // runtime already copies into `env`; nothing to ship for those.
-                if cache.old_exports.contains(name) || cache.old_imports.contains(name) {
-                    continue;
-                }
-                // Resolve through the shared ifunc table, but only when the signature matches the
-                // base slot. A name-matched-but-mismatched pair would fail instantiation with a
-                // LinkError; leaving it out makes the runtime install a trapping stub instead, which
-                // mirrors the old `call_indirect` behavior (it would only trap if actually called).
-                if let Some(&idx) = name_to_ifunc_old.get(name) {
-                    let ty = new.types.get(new.funcs.get(func_id).ty());
-                    let sig = (ty.params().to_vec(), ty.results().to_vec());
-                    if old_sigs.get(&idx) == Some(&sig) {
-                        env_ifunc.push((name.to_string(), idx));
-                    } else {
-                        env_skipped_sig += 1;
-                    }
-                }
-            }
-            // `__wbindgen_placeholder__` imports are resolved by the runtime from the base module's
-            // `__saved_wbg_*` exports (or a trapping stub), so we don't need to ship anything.
-            _ => {}
         }
     }
 
+    let got_mutable = analysis.got_mutable.unwrap_or(true);
     let n_got_func = got_func.len();
     let n_got_mem = got_mem.len();
     let n_env_ifunc = env_ifunc.len();
 
     // Build the address map (old ifunc index → new ifunc index) and the in-place repoint set exactly
     // as the walrus path does — these are pure analysis over the unmodified module.
-    let name_to_ifunc_new = collect_func_ifuncs(&new);
-    let ifunc_count = name_to_ifunc_new.len() as u64;
+    let ifunc_count = analysis.name_to_ifunc.len() as u64;
     let mut map = AddressMap::default();
-    for (name, idx) in name_to_ifunc_new.iter() {
-        if let Some(old_idx) = name_to_ifunc_old.get(*name) {
+    for (name, idx) in analysis.name_to_ifunc.iter() {
+        if let Some(old_idx) = name_to_ifunc_old.get(name.as_str()) {
             map.insert(*old_idx as u64, *idx as u64);
         }
     }
 
-    let new_sigs = collect_ifunc_signatures(&new);
     let mut ifunc_repoint = Vec::new();
     for (&old_idx, &new_idx) in map.iter() {
         if let (Some(old_sig), Some(new_sig)) = (
             old_sigs.get(&(old_idx as i32)),
-            new_sigs.get(&(new_idx as i32)),
+            analysis.ifunc_sigs.get(&(new_idx as i32)),
         ) {
             if old_sig == new_sig {
                 ifunc_repoint.push((old_idx, new_idx));
@@ -636,8 +853,8 @@ fn create_wasm_jump_table_fast(
 
     // Find the function index (in the *served* module's index space, which we don't change) of the
     // global-relocs thunk so we can export it. wasm-ld refuses to export this synthetic function, but
-    // the runtime must call it. We read the index straight from the name section so it matches the
-    // real module layout — `Function::name` in walrus comes from that same section.
+    // the runtime must call it. We read the index from the linking symbol table (falling back to the
+    // name section) so it matches the real module layout.
     // wasm-ld only synthesizes `__wasm_apply_global_relocs` when the patch has `GOT.func.internal`
     // globals to rebase by `__table_base`. When it's absent there's simply nothing to relocate, so a
     // missing export is expected, not an error. When present we must export it (wasm-ld won't) so the
@@ -648,9 +865,6 @@ fn create_wasm_jump_table_fast(
             "patch has no __wasm_apply_global_relocs (no internal global relocs needed)"
         );
     }
-
-    // Drop the walrus module before the byte pass — we're done analyzing and it holds a lot of memory.
-    drop(new);
 
     // Produce the served bytes from the *original* linker output: strip custom sections we don't
     // serve, drop the start section, and add the relocs export. The code/data/import sections are
@@ -689,7 +903,7 @@ fn create_wasm_jump_table_fast(
             got_func,
             got_mem,
             env_ifunc,
-            got_mutable: got_mutable.unwrap_or(true),
+            got_mutable,
         }),
         base_id: cache.base_id,
     })
