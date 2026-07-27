@@ -149,7 +149,8 @@ impl BuildRequest {
         // Replay the rustcs for all modified workspace crates. This is not the final tip binary.
         // Note that the final tip might include itself as a lib (lib.rs + main.rs) which gets covered here.
         ctx.profile_phase("Workspace hotpatch replay");
-        let replay_levels = self.workspace_hotpatch_replay_levels(modified_crates)?;
+        let replay_levels =
+            self.workspace_hotpatch_replay_levels(modified_crates, workspace_rustc_args)?;
         let replayed_crates: Vec<String> = replay_levels.iter().flatten().cloned().collect();
         tracing::debug!(
             "replaying {} crates in {} dependency levels: {replay_levels:?}",
@@ -726,12 +727,43 @@ impl BuildRequest {
     fn workspace_hotpatch_replay_levels(
         &self,
         modified_crates: &HashSet<String>,
+        workspace_rustc_args: &WorkspaceRustcArgs,
     ) -> Result<Vec<Vec<String>>> {
         // Exclude the tip crate — it's compiled separately via cargo_build after replay.
         let tip = self.tip_crate_name();
+
+        // `modified_crates` is derived from the raw Cargo workspace graph (`workspace_dependents_of`),
+        // which is feature- and target-agnostic. A crate can appear here yet never have been compiled
+        // into the fat baseline — most commonly an OPTIONAL dependency behind a disabled feature: its
+        // outgoing edges make it a "dependent" of things you edit, but the build never emitted it, so
+        // no rustc args were captured. Replaying such a crate is impossible (nothing to replay) and
+        // wrong (it isn't in the binary), so drop it. We key off captured args as the source of truth
+        // for "what the fat build actually compiled".
+        let skipped: Vec<&String> = modified_crates
+            .iter()
+            .filter(|name| {
+                **name != tip
+                    && self
+                        .workspace_hotpatch_replay_args(workspace_rustc_args, name)
+                        .is_none()
+            })
+            .collect();
+        if !skipped.is_empty() {
+            tracing::debug!(
+                "Skipping {} modified crate(s) with no captured rustc args (not in the fat build, \
+                 e.g. optional deps behind disabled features): {skipped:?}",
+                skipped.len(),
+            );
+        }
+
         let crates: HashSet<&String> = modified_crates
             .iter()
-            .filter(|name| **name != tip)
+            .filter(|name| {
+                **name != tip
+                    && self
+                        .workspace_hotpatch_replay_args(workspace_rustc_args, name)
+                        .is_some()
+            })
             .collect();
 
         // Build the subgraph: edge A→B means "A must compile before B".

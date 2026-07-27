@@ -611,6 +611,10 @@ struct PatchWasmAnalysis {
     env_funcs: Vec<(String, SigVec)>,
     /// Function name → ifunc-table index, from the active element segments.
     name_to_ifunc: HashMap<String, i32>,
+    /// Number of table slots the patch's element segments occupy (highest `offset + len` across
+    /// segments). This is what the table must grow by — NOT `name_to_ifunc.len()`, which undercounts
+    /// whenever two element items share a mangled name (common for generic `fmt`/drop-glue impls).
+    ifunc_slots: u64,
     /// ifunc-table index → signature.
     ifunc_sigs: HashMap<i32, SigVec>,
     /// True when a `wbg_cast` function *body* is present and must be rewritten (forces walrus path).
@@ -748,6 +752,15 @@ fn analyze_patch_wasm(bytes: &[u8]) -> Result<PatchWasmAnalysis> {
         }
     }
 
+    // Slots needed = highest table index any element segment reaches. The runtime places each
+    // segment at `__table_base + offset` and writes `ids.len()` consecutive entries, so the table
+    // must grow by this much or `WebAssembly.instantiate` throws "table index is out of bounds".
+    let ifunc_slots = elements
+        .iter()
+        .map(|(offset, ids)| (*offset).max(0) as u64 + ids.len() as u64)
+        .max()
+        .unwrap_or(0);
+
     let needs_body_rewrite = func_names
         .values()
         .any(|n| n.contains("wasm_bindgen4__rt8wbg_cast") && !n.contains("breaks_if_inline"));
@@ -758,6 +771,7 @@ fn analyze_patch_wasm(bytes: &[u8]) -> Result<PatchWasmAnalysis> {
         got_mutable,
         env_funcs,
         name_to_ifunc,
+        ifunc_slots,
         ifunc_sigs,
         needs_body_rewrite,
     })
@@ -830,7 +844,12 @@ fn create_wasm_jump_table_fast(
 
     // Build the address map (old ifunc index → new ifunc index) and the in-place repoint set exactly
     // as the walrus path does — these are pure analysis over the unmodified module.
-    let ifunc_count = analysis.name_to_ifunc.len() as u64;
+    //
+    // `ifunc_count` is how much the runtime grows the shared table; it must equal the element
+    // segment's slot count, not `name_to_ifunc.len()` — the latter collapses element items that
+    // share a mangled name (generic `fmt`/`Write`/drop-glue impls), so it undercounts and the patch
+    // then instantiates with "table index is out of bounds".
+    let ifunc_count = analysis.ifunc_slots;
     let mut map = AddressMap::default();
     for (name, idx) in analysis.name_to_ifunc.iter() {
         if let Some(old_idx) = name_to_ifunc_old.get(name.as_str()) {
@@ -1282,7 +1301,10 @@ fn create_wasm_jump_table_walrus(
     // The ifunc_count will be passed to the dynamic loader so it can allocate the right amount of space
     // in the indirect function table when loading the patch.
     let name_to_ifunc_new = collect_func_ifuncs(&new);
-    let ifunc_count = name_to_ifunc_new.len() as u64;
+    // Must be the element segment's slot count, not `name_to_ifunc_new.len()`: the latter collapses
+    // element items sharing a mangled name, so it undercounts and the runtime grows the shared table
+    // too little → "table index is out of bounds" at instantiate.
+    let ifunc_count = count_ifunc_slots(&new);
     let mut map = AddressMap::default();
     for (name, idx) in name_to_ifunc_new.iter() {
         // Find the corresponding ifunc in the old module by name
@@ -1391,6 +1413,31 @@ fn convert_func_to_ifunc_call(
     }));
 
     new.funcs.get_mut(func_id).kind = FunctionKind::Local(builder.local_func(locals));
+}
+
+/// Number of table slots the module's active element segments occupy (highest `offset + len`).
+/// This is what the runtime must grow the shared table by; unlike `collect_func_ifuncs().len()` it
+/// counts every element item, including ones whose function shares a mangled name with another.
+fn count_ifunc_slots(m: &Module) -> u64 {
+    let mut slots = 0u64;
+    for el in m.elements.iter() {
+        let ElementKind::Active { offset, .. } = &el.kind else {
+            continue;
+        };
+        let offset = match offset {
+            ConstExpr::Value(walrus::ir::Value::I32(idx)) => *idx as i64,
+            ConstExpr::Value(walrus::ir::Value::I64(idx)) => *idx,
+            // Global-relative (imported `__table_base`): explicit offset contributes 0.
+            ConstExpr::Global(_) => 0,
+            _ => continue,
+        };
+        let len = match &el.items {
+            ElementItems::Functions(ids) => ids.len() as u64,
+            ElementItems::Expressions(_, exprs) => exprs.len() as u64,
+        };
+        slots = slots.max(offset.max(0) as u64 + len);
+    }
+    slots
 }
 
 fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
