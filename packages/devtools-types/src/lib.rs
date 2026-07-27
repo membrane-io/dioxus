@@ -18,7 +18,7 @@ pub enum DevserverMsg {
     FullReloadStart,
 
     /// The full reload failed.
-    FullReloadFailed,
+    FullReloadFailed { errors: Vec<BuildError> },
 
     /// The app should reload completely if it can
     FullReloadCommand,
@@ -52,8 +52,51 @@ pub struct HotReloadMsg {
     pub for_pid: Option<u32>,
 }
 
+/// A build error with rendered compiler output and source locations.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct BuildError {
+    pub message: String,
+    pub rendered: String,
+    pub locations: Vec<SourceLocation>,
+}
+
+/// A source location associated with a build error.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct SourceLocation {
+    pub path: PathBuf,
+    pub line: usize,
+    pub column: usize,
+}
+
 impl HotReloadMsg {
     pub fn is_empty(&self) -> bool {
         self.templates.is_empty() && self.assets.is_empty() && self.jump_table.is_none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_reload_failed_serializes_errors_and_locations() {
+        let message = DevserverMsg::FullReloadFailed {
+            errors: vec![BuildError {
+                message: "cannot find value `missing`".into(),
+                rendered: "error[E0425]: cannot find value `missing`".into(),
+                locations: vec![SourceLocation {
+                    path: "/workspace/src/main.rs".into(),
+                    line: 12,
+                    column: 7,
+                }],
+            }],
+        };
+
+        let serialized = serde_json::to_string(&message).unwrap();
+        let deserialized: DevserverMsg = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(deserialized, message);
+        assert!(serialized.contains(r#""line":12"#));
+        assert!(serialized.contains(r#""column":7"#));
     }
 }

@@ -357,7 +357,7 @@ impl App {
                 TOAST_TIMEOUT_LONG,
                 false,
             ),
-            DevserverMsg::FullReloadFailed => self.send_toast_to_all(
+            DevserverMsg::FullReloadFailed { .. } => self.send_toast_to_all(
                 "Oops! The build failed.",
                 "We tried to rebuild your app, but something went wrong.",
                 "error",

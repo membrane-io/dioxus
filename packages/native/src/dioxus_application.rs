@@ -82,7 +82,7 @@ impl DioxusNativeApplication {
                 }
                 dioxus_devtools::DevserverMsg::Shutdown => event_loop.exit(),
                 dioxus_devtools::DevserverMsg::FullReloadStart => {}
-                dioxus_devtools::DevserverMsg::FullReloadFailed => {}
+                dioxus_devtools::DevserverMsg::FullReloadFailed { .. } => {}
                 dioxus_devtools::DevserverMsg::FullReloadCommand => {}
                 _ => {}
             },

@@ -3556,6 +3556,7 @@ version = "0.8.0-alpha.1"
 dependencies = [
  "dioxus-core",
  "serde",
+ "serde_json",
  "subsecond-types",
 ]
 

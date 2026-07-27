@@ -99,7 +99,7 @@ fn make_ws(tx: UnboundedSender<HotReloadMsg>, poll_interval: i32, reload: bool) 
                 ),
 
                 // The devserver is telling us that the full rebuild failed.
-                Ok(DevserverMsg::FullReloadFailed) => show_toast(
+                Ok(DevserverMsg::FullReloadFailed { .. }) => show_toast(
                     "Oops! The build failed.",
                     "We tried to rebuild your app, but something went wrong.",
                     ToastLevel::Error,
