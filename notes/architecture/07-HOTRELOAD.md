@@ -144,11 +144,18 @@ pub enum DevserverMsg {
     HotReload(HotReloadMsg),  // Templates + optional jump table
     HotPatchStart,            // Binary patching starting
     FullReloadStart,          // Rebuilding entire app
-    FullReloadFailed,         // Build failed
+    FullReloadFailed {        // Build failed with compiler diagnostics
+        errors: Vec<BuildError>,
+    },
     FullReloadCommand,        // Full page reload needed
     Shutdown,                 // Devserver shutting down
 }
 ```
+
+Each `BuildError` includes its plain message, rendered compiler output, and zero or more primary
+source locations. Locations contain an absolute path plus a one-based line and column so devtools
+clients can link directly to the source. Build steps without compiler spans still produce an error
+with an empty locations list.
 
 ### HotReloadMsg Structure
 

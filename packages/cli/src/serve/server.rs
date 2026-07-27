@@ -18,7 +18,10 @@ use axum::{
     response::IntoResponse,
     routing::{get, get_service},
 };
-use dioxus_devtools_types::{DevserverMsg, HotReloadMsg};
+use cargo_metadata::diagnostic::DiagnosticLevel;
+use dioxus_devtools_types::{
+    BuildError as DevserverBuildError, DevserverMsg, HotReloadMsg, SourceLocation,
+};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_util::{
     StreamExt, future,
@@ -31,7 +34,7 @@ use std::{
     convert::Infallible,
     fs, io,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
@@ -60,6 +63,8 @@ pub(crate) struct WebServer {
     new_hot_reload_sockets: UnboundedReceiver<ConnectedWsClient>,
     new_build_status_sockets: UnboundedReceiver<ConnectedWsClient>,
     build_status: SharedStatus,
+    build_errors: Vec<DevserverBuildError>,
+    build_root: PathBuf,
     application_name: String,
     bundle: BundleFormat,
 }
@@ -118,6 +123,8 @@ impl WebServer {
 
         Ok(Self {
             build_status,
+            build_errors: Vec::new(),
+            build_root: runner.client().build.crate_dir(),
             proxied_port,
             devserver_exposed_ip,
             devserver_port,
@@ -207,6 +214,7 @@ impl WebServer {
 
     /// Sends a start build message to all clients.
     pub(crate) async fn start_build(&mut self) {
+        self.build_errors.clear();
         self.build_status.set(Status::Building {
             progress: 0.0,
             build_message: "Starting the build...".to_string(),
@@ -221,7 +229,9 @@ impl WebServer {
                 // Todo(miles): wire up more messages into the splash screen UI
                 match stage {
                     BuildStage::Success => {}
-                    BuildStage::Failed => self.send_reload_failed().await,
+                    BuildStage::Failed => {
+                        self.send_reload_failed(self.build_errors.clone()).await
+                    }
                     BuildStage::Restarting => self.send_reload_start().await,
                     BuildStage::Initializing => {}
                     BuildStage::InstallingTooling => {}
@@ -247,14 +257,60 @@ impl WebServer {
                     _ => {}
                 }
             }
-            BuilderUpdate::CompilerMessage { .. } => {}
+            BuilderUpdate::CompilerMessage { message } => {
+                if matches!(
+                    message.level,
+                    DiagnosticLevel::Error | DiagnosticLevel::Ice
+                ) {
+                    let rendered = message
+                        .rendered
+                        .as_deref()
+                        .unwrap_or(&message.message);
+                    let locations = message
+                        .spans
+                        .iter()
+                        .filter(|span| span.is_primary)
+                        .filter_map(|span| {
+                            let path = Path::new(&span.file_name);
+                            let path = if path.is_absolute() {
+                                path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+                            } else {
+                                self.build_root.join(path).canonicalize().ok()?
+                            };
+                            Some(SourceLocation {
+                                path,
+                                line: span.line_start,
+                                column: span.column_start,
+                            })
+                        })
+                        .collect();
+                    self.build_errors.push(DevserverBuildError {
+                        message: message.message.clone(),
+                        rendered: console::strip_ansi_codes(rendered).into_owned(),
+                        locations,
+                    });
+                }
+            }
             BuilderUpdate::BuildReady { .. } => {}
             BuilderUpdate::BuildFailed { err } => {
-                let error = err.to_string();
+                let mut errors = self.build_errors.clone();
+                if errors.is_empty() {
+                    let error = err.to_string();
+                    errors.push(DevserverBuildError {
+                        message: error.clone(),
+                        rendered: error,
+                        locations: Vec::new(),
+                    });
+                }
+                let error = errors
+                    .iter()
+                    .map(|error| error.rendered.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 self.build_status.set(Status::BuildError {
                     error: ansi_to_html::convert(&error).unwrap_or(error),
                 });
-                self.send_reload_failed().await;
+                self.send_reload_failed(errors).await;
                 self.send_build_status().await;
             }
             BuilderUpdate::StdoutReceived { .. } => {}
@@ -351,8 +407,8 @@ impl WebServer {
     }
 
     /// Tells all clients that a full rebuild has failed.
-    pub(crate) async fn send_reload_failed(&mut self) {
-        self.send_devserver_message_to_all(DevserverMsg::FullReloadFailed)
+    pub(crate) async fn send_reload_failed(&mut self, errors: Vec<DevserverBuildError>) {
+        self.send_devserver_message_to_all(DevserverMsg::FullReloadFailed { errors })
             .await;
     }
 

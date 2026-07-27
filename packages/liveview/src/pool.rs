@@ -227,7 +227,7 @@ pub async fn run(mut vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), Li
                     },
                     dioxus_devtools::DevserverMsg::FullReloadCommand
                     | dioxus_devtools::DevserverMsg::FullReloadStart
-                    | dioxus_devtools::DevserverMsg::FullReloadFailed => {
+                    | dioxus_devtools::DevserverMsg::FullReloadFailed { .. } => {
                         // usually only web gets this message - what are we supposed to do?
                         // Maybe we could just binary patch ourselves in place without losing window state?
                     },
