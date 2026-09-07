@@ -112,6 +112,16 @@ pub(crate) struct TargetArgs {
     #[clap(long, default_value_t = false, help_heading = HELP_HEADING)]
     pub(crate) keep_names: bool,
 
+    /// Keep the DWARF out of the wasm binary, and write the linker output as a sidecar file
+    /// next to it (`<name>_bg.dwarf.wasm`) [default: false]
+    ///
+    /// wasm-bindgen then runs without `--keep-debug`, which skips its DWARF conversion, and with
+    /// `--no-demangle`, so that a tool can pair the functions of both files by symbol. The JS
+    /// glue fetches the sidecar after the module starts and attaches it through
+    /// `wasmStackTrace` (the wasm-stack-trace library), when the page installed it.
+    #[clap(long, default_value_t = false, help_heading = HELP_HEADING)]
+    pub(crate) dwarf_sidecar: bool,
+
     /// The name of the device we are hoping to upload to. By default, dx tries to upload to the active
     /// simulator. If the device name is passed, we will upload to that device instead.
     ///
@@ -199,6 +209,7 @@ impl Anonymized for TargetArgs {
             "wasm_split": self.wasm_split,
             "debug_symbols": self.debug_symbols,
             "keep_names": self.keep_names,
+            "dwarf_sidecar": self.dwarf_sidecar,
             "device": self.device,
             "base_path": self.base_path.is_some(),
             "cargo_args": self.cargo_args.is_some(),

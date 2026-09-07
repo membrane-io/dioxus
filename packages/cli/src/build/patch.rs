@@ -2264,13 +2264,17 @@ fn read_uleb128(bytes: &[u8]) -> Option<(u32, usize)> {
 /// to the export table.
 ///
 /// It also moves all functions and memories to be callable indirectly.
-pub fn prepare_wasm_base_module(bytes: &[u8]) -> Result<Vec<u8>> {
+///
+/// With `keep_dwarf`, walrus converts the DWARF of the module and writes it back. Without it,
+/// walrus drops the DWARF, which saves most of the time on a large module. A build with a DWARF
+/// sidecar passes `false`: the sidecar is a copy of the input, and it holds the DWARF.
+pub fn prepare_wasm_base_module(bytes: &[u8], keep_dwarf: bool) -> Result<Vec<u8>> {
     let ParsedModule {
         mut module,
         ids,
         symbols,
         ..
-    } = parse_module_with_ids_config(bytes, true)?;
+    } = parse_module_with_ids_config(bytes, keep_dwarf)?;
 
     // Due to monomorphizations, functions will get merged and multiple names will point to the same function.
     // Walrus loses this information, so we need to manually parse the names table to get the indices
@@ -2622,7 +2626,7 @@ fn prepare_wasm_preserves_dwarf() {
     let bytes = std::fs::read(&path).expect("read input wasm");
     eprintln!("input bytes={}", bytes.len());
 
-    let out = prepare_wasm_base_module(&bytes).expect("prepare_wasm_base_module");
+    let out = prepare_wasm_base_module(&bytes, true).expect("prepare_wasm_base_module");
     eprintln!("output bytes={}", out.len());
 
     let mut debug_total = 0usize;

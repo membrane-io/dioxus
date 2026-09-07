@@ -263,6 +263,7 @@ pub(crate) struct BuildRequest {
     pub(crate) wasm_split: bool,
     pub(crate) debug_symbols: bool,
     pub(crate) keep_names: bool,
+    pub(crate) dwarf_sidecar: bool,
     pub(crate) inject_loading_scripts: bool,
     pub(crate) custom_linker: Option<PathBuf>,
     pub(crate) base_path: Option<String>,
@@ -916,6 +917,7 @@ impl BuildRequest {
             wasm_split: args.wasm_split,
             debug_symbols: args.debug_symbols,
             keep_names: args.keep_names,
+            dwarf_sidecar: args.dwarf_sidecar,
             inject_loading_scripts: args.inject_loading_scripts,
             apple_entitlements: args.apple_entitlements.clone(),
             apple_team_id: args.apple_team_id.clone(),
@@ -2551,7 +2553,7 @@ impl BuildRequest {
     /// symbolicator resolves names from DWARF, not this section), but keeping it lets tools like
     /// `console_error_panic_hook` print readable backtraces without a browser extension.
     pub(crate) fn keep_wasm_names(&self) -> bool {
-        self.keep_names || self.config.web.wasm_opt.keep_names
+        self.keep_names || self.config.web.wasm_opt.keep_names || self.dwarf_sidecar
     }
 
     pub(crate) fn root_dir(&self) -> PathBuf {

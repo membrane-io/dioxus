@@ -100,10 +100,19 @@ impl BuildRequest {
         _ = std::fs::remove_dir_all(&bindgen_outdir);
         std::fs::create_dir_all(&bindgen_outdir)?;
 
+        // The DWARF sidecar is the linker output as it is, before any tool re-encodes the
+        // code. The copy comes first, because the hot-patch step below writes `exe` in place.
+        if self.dwarf_sidecar {
+            let sidecar = self.wasm_bindgen_sidecar_file();
+            tracing::debug!(dx_src = ?TraceSrc::Bundle, "Copying the linker output to the DWARF sidecar {}", sidecar.display());
+            std::fs::copy(exe, &sidecar)?;
+        }
+
         // Lift the internal functions to exports
         if ctx.mode == BuildMode::Fat {
             let unprocessed = std::fs::read(exe)?;
-            let all_exported_bytes = crate::build::prepare_wasm_base_module(&unprocessed)?;
+            let all_exported_bytes =
+                crate::build::prepare_wasm_base_module(&unprocessed, !self.dwarf_sidecar)?;
             std::fs::write(exe, all_exported_bytes)?;
         }
 
@@ -113,14 +122,18 @@ impl BuildRequest {
         //
         // We leave demangling to false since it's faster and these tools seem to prefer the raw symbols.
         // todo(jon): investigate if the chrome extension needs them demangled or demangles them automatically.
-        let keep_debug = self.config.web.wasm_opt.debug
-            || self.debug_symbols
-            || self.wasm_split
-            || !self.release
-            || ctx.mode == BuildMode::Fat;
+        // With a DWARF sidecar, the shipped module carries no DWARF, and it must keep the
+        // `name` section: the code map pairs the functions of both files by symbol.
+        let keep_debug = !self.dwarf_sidecar
+            && (self.config.web.wasm_opt.debug
+                || self.debug_symbols
+                || self.wasm_split
+                || !self.release
+                || ctx.mode == BuildMode::Fat);
         let keep_names = self.config.web.wasm_opt.keep_names
             || self.keep_names
             || self.wasm_split
+            || self.dwarf_sidecar
             || ctx.mode == BuildMode::Fat;
         let demangle = false;
         let wasm_opt_options = WasmOptConfig {
@@ -339,9 +352,33 @@ __wbg_init({{module_or_path: __dx_wasmSource}}).then((wasm) => {{
     if (wasm.__wbindgen_start == undefined) {{
         wasm.main();
     }}
-}});
+{attach_sidecar}}});
 "#,
             self.base_path_or_default(),
+            attach_sidecar = if self.dwarf_sidecar {
+                format!(
+                    r#"
+    // The module carries no DWARF. The sidecar holds it, and `wasmStackTrace` (the
+    // wasm-stack-trace library, when the page installed it) attaches it to the module,
+    // so that stack traces and the DWARF inspector read it. The fetch starts after the
+    // module runs, so it does not delay the start of the app.
+    if (globalThis.wasmStackTrace?.attachSidecar) {{
+        fetch("/{base}/wasm/{sidecar}")
+            .then((response) => response.arrayBuffer())
+            .then((bytes) => globalThis.wasmStackTrace.attachSidecar(wasmModule, bytes))
+            .catch((e) => console.warn("The DWARF sidecar did not load:", e));
+    }}
+"#,
+                    base = self.base_path_or_default(),
+                    sidecar = self
+                        .wasm_bindgen_sidecar_file()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy(),
+                )
+            } else {
+                String::new()
+            },
         )?;
 
         Ok(())
@@ -627,6 +664,14 @@ __wbg_init({{module_or_path: __dx_wasmSource}}).then((wasm) => {{
         self.wasm_bindgen_out_dir()
             .join(format!("{}_bg", self.executable_name()))
             .with_extension("wasm")
+    }
+
+    /// The DWARF sidecar next to the wasm-bindgen output: the linker output, kept as it is,
+    /// when the build runs with `--dwarf-sidecar`.
+    pub(crate) fn wasm_bindgen_sidecar_file(&self) -> PathBuf {
+        self.wasm_bindgen_out_dir()
+            .join(format!("{}_bg", self.executable_name()))
+            .with_extension("dwarf.wasm")
     }
 
     /// Get the path where the unstripped (linker-sidecars intact) copy of the
