@@ -2923,8 +2923,14 @@ impl BuildRequest {
     /// Find workspace crates that directly depend on the given crate.
     ///
     /// Returns underscore-normalized crate names of workspace members that have `crate_name`
-    /// as a dependency. Used for cascade detection — when a dep's public symbols change,
-    /// its dependents need recompilation too.
+    /// as a normal or a build dependency. Used for cascade detection — when a dep's public
+    /// symbols change, its dependents need recompilation too.
+    ///
+    /// This ignores a dev-dependency. Cargo builds a dev-dependency only for a test, an example
+    /// or a benchmark target, so such a crate never enters the binary that we patch. A dev edge
+    /// can also point backwards: crate A depends on B, and B dev-depends on A. Cargo accepts
+    /// that, but it makes a cycle here, and the replay sort in `workspace_hotpatch_replay_levels`
+    /// then fails with "Cycle in workspace dependency graph".
     pub(crate) fn workspace_dependents_of(&self, crate_name: &str) -> Vec<String> {
         let krates = &self.workspace.krates;
 
@@ -2959,11 +2965,20 @@ impl BuildRequest {
             .into_iter()
             .filter_map(|dep| {
                 let name = dep.krate.name.replace('-', "_");
-                if workspace_names.contains(&name) {
-                    Some(name)
-                } else {
-                    None
+                if !workspace_names.contains(&name) {
+                    return None;
                 }
+
+                // `direct_dependents` reports a crate once, and it keeps the first edge that it
+                // finds, which can be the dev edge. Read the kind from the dependent's manifest
+                // instead, so a crate that depends on the target both normally and for its tests
+                // still counts as a dependent.
+                let needs_target = dep.krate.dependencies.iter().any(|d| {
+                    d.name.replace('-', "_") == crate_name
+                        && d.kind != krates::cm::DependencyKind::Development
+                });
+
+                needs_target.then_some(name)
             })
             .collect()
     }

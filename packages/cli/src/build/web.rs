@@ -321,8 +321,15 @@ impl BuildRequest {
             r#"
 globalThis.__wasm_split_main_initSync = initSync;
 
+// A host page can fetch the wasm file before it imports this module, and it then
+// puts the response, or a promise of it, in `__dx_wasmSource`. `__wbg_init` accepts
+// a Response and still compiles the module as it streams. The host must check that
+// the bytes come from the link that runs now, because this file is written in place
+// on each link. Without that global, this module fetches the file itself.
+const __dx_wasmSource = globalThis.__dx_wasmSource ?? "/{}/{wasm_path}";
+
 // Actually perform the load
-__wbg_init({{module_or_path: "/{}/{wasm_path}"}}).then((wasm) => {{
+__wbg_init({{module_or_path: __dx_wasmSource}}).then((wasm) => {{
     // assign this module to be accessible globally
     globalThis.__dx_mainWasm = wasm;
     globalThis.__dx_mainInit = __wbg_init;
