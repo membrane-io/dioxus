@@ -201,17 +201,51 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                                 if let Err(err) =
                                     builder.hotpatch(&bundle, id, cache, &mut devserver).await
                                 {
-                                    tracing::error!("Failed to hot-patch app: {err}");
+                                    // Name the files of this patch, so the user knows which edit
+                                    // the patch engine refused.
+                                    let changed = match &bundle.mode {
+                                        BuildMode::Thin { changed_files, .. } => changed_files
+                                            .iter()
+                                            .map(|f| {
+                                                f.strip_prefix(
+                                                    builder.client().build.workspace_dir(),
+                                                )
+                                                .unwrap_or(f)
+                                                .display()
+                                                .to_string()
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
+                                        _ => String::new(),
+                                    };
 
-                                    if let Some(_patching) = err.downcast_ref::<PatchError>() {
-                                        tracing::info!("Starting full rebuild: {err}");
+                                    tracing::error!(
+                                        "{ERROR_STYLE}Hot-patch failed{ERROR_STYLE:#} for [{changed}]: {}",
+                                        crate::error::log_stacktrace(&err, 0),
+                                        ERROR_STYLE = crate::styles::ERROR_STYLE,
+                                    );
+
+                                    if let Some(patch_err) = err.downcast_ref::<PatchError>() {
+                                        tracing::info!(
+                                            "Starting a full rebuild, because the patch engine reported: {patch_err}"
+                                        );
                                         builder.full_rebuild().await;
                                         devserver.send_reload_start().await;
                                         devserver.start_build().await;
+                                    } else {
+                                        tracing::warn!(
+                                            "The app keeps the last patch. Press `r` for a full rebuild."
+                                        );
                                     }
                                 }
                             }
                             BuildMode::Base | BuildMode::Fat => {
+                                // The new bundle replaces the bundle that the devserver serves.
+                                // Drop the patches and the templates of the previous binary before
+                                // any client can connect, because the new binary cannot accept
+                                // them.
+                                builder.commit_rebuilt_artifact(id);
+
                                 _ = builder
                                     .open(&bundle, &mut devserver)
                                     .await

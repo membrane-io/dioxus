@@ -647,11 +647,12 @@ impl AppServer {
                     if let Some(server) = self.server.as_mut() {
                         server.start_rebuild(BuildMode::Fat, BuildId::SECONDARY);
                     }
-                    self.clear_hot_reload_changes();
+                    // Keep the catch-up state (the patches and the applied hot-reload message)
+                    // until the new bundle lands. The devserver still serves the previous fat
+                    // binary for the whole rebuild, so a tab that opens now must receive the same
+                    // patches as the tabs that already run. `commit_rebuilt_artifact` drops them
+                    // when the new bundle replaces the old one.
                     self.clear_cached_rsx();
-                    if needs_deep_rebuild {
-                        self.clear_patches();
-                    }
                     server.send_reload_start().await;
                 }
 
@@ -668,7 +669,9 @@ impl AppServer {
                     if let Some(server) = self.server.as_mut() {
                         server.patch_rebuild(files.to_vec(), changed_crates, BuildId::SECONDARY);
                     }
-                    self.clear_hot_reload_changes();
+                    // The applied templates stay until the patch lands, for the same reason as
+                    // the fat path above: a tab that opens during the patch build gets the old
+                    // binary and needs the templates that the running tabs already applied.
                     self.clear_cached_rsx();
                     server.send_patch_start().await;
                 }
@@ -679,7 +682,6 @@ impl AppServer {
                     if let Some(server) = self.server.as_mut() {
                         server.start_rebuild(BuildMode::Base, BuildId::SECONDARY);
                     }
-                    self.clear_hot_reload_changes();
                     self.clear_cached_rsx();
                     server.send_reload_start().await;
                 }
@@ -889,9 +891,28 @@ impl AppServer {
             s.start_rebuild(build_mode, BuildId::SECONDARY);
         }
 
-        self.clear_hot_reload_changes();
+        // The patches and the applied hot-reload message stay until the new bundle lands. See
+        // `commit_rebuilt_artifact`.
         self.clear_cached_rsx();
-        self.clear_patches();
+    }
+
+    /// Drop the catch-up state that belongs to the binary that this build replaces.
+    ///
+    /// The devserver serves the previous bundle for the whole rebuild, and it replays the last
+    /// jump table and the applied templates to every client that connects
+    /// ([`Self::applied_hot_reload_changes`]). Both belong to that previous binary. The new bundle
+    /// contains the same changes, so the runner drops them here, at the moment the new bundle
+    /// replaces the old one on disk.
+    ///
+    /// The caller must call this before it opens the app, so that no client receives a jump table
+    /// that the new binary cannot accept.
+    pub(crate) fn commit_rebuilt_artifact(&mut self, id: BuildId) {
+        if id == BuildId::PRIMARY {
+            self.client.patches.clear();
+            self.clear_hot_reload_changes();
+        } else if let Some(server) = self.server.as_mut() {
+            server.patches.clear();
+        }
     }
 
     pub(crate) async fn hotpatch(
@@ -919,6 +940,9 @@ impl AppServer {
         }?;
 
         if id == BuildId::PRIMARY {
+            // The patch contains the templates that the runner replayed until now, so a new client
+            // must not receive them a second time. The jump table replaces them.
+            self.clear_hot_reload_changes();
             self.applied_client_hot_reload_message.jump_table = self.client.patches.last().cloned();
         }
 
@@ -1002,16 +1026,12 @@ impl AppServer {
         msg
     }
 
-    /// Clear the hot reload changes. This should be called any time a new build is starting
+    /// Clear the templates and the assets that the runner replays to a new client.
+    ///
+    /// Call this when a new binary contains those changes, not when a build starts. See
+    /// [`Self::commit_rebuilt_artifact`].
     pub(crate) fn clear_hot_reload_changes(&mut self) {
         self.applied_client_hot_reload_message = Default::default();
-    }
-
-    pub(crate) fn clear_patches(&mut self) {
-        self.client.patches.clear();
-        if let Some(server) = self.server.as_mut() {
-            server.patches.clear();
-        }
     }
 
     /// Returns a static label for the current hotreload mode (used by both the TUI and logs).
@@ -1778,14 +1798,14 @@ impl AppServer {
         }
         self.workspace = new_workspace;
 
-        // Caches keyed off the old `BuildRequest` would now be wrong. The patch cache is for
-        // the previous fat binary's symbol table, the file_map RSX templates assume the old
-        // crate layout, and the applied hot-reload set should be re-empty so the freshly
-        // opened app starts from a clean slate.
-        self.clear_patches();
+        // Caches keyed off the old `BuildRequest` would now be wrong: the file_map RSX templates
+        // assume the old crate layout.
+        //
+        // The patches and the applied hot-reload message stay. They belong to the binary that the
+        // devserver still serves, and a client that connects during the rebuild needs them.
+        // `commit_rebuilt_artifact` drops them when the new bundle lands.
         self.clear_cached_rsx();
         self.file_map.clear();
-        self.applied_client_hot_reload_message = Default::default();
 
         // Tailwind input/output paths come from `application.tailwind_*` in `Dioxus.toml` —
         // restart the watcher so it picks up any change.
