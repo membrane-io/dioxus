@@ -39,6 +39,17 @@ use target_lexicon::{Architecture, OperatingSystem};
 use tokio::{io::AsyncBufReadExt, process::Command};
 use uuid::Uuid;
 
+/// Marks an error of the replay step of a thin build, so that the fallback of the interface
+/// gate does not retry a compile error in the changed crate itself.
+#[derive(Debug)]
+struct ReplayFailed;
+
+impl std::fmt::Display for ReplayFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the replay of a workspace crate failed")
+    }
+}
+
 impl BuildRequest {
     /// We're going to create a DAG of modified crates, replay their rustc commands directly, and then
     /// manually link at the end.
@@ -134,9 +145,102 @@ impl BuildRequest {
     /// some are experimental, and each has their own syntax ie `-C, /C, --C, C=` which need to be handlded.
     pub async fn compile_workspace_hotpatch(&self, ctx: &BuildContext) -> Result<BuildArtifacts> {
         let BuildMode::Thin {
+            modified_crates,
+            replay_in_place,
+            replay_out_of_place,
+            out_of_place_crates,
+            ..
+        } = &ctx.mode
+        else {
+            bail!("Not thin mode!")
+        };
+
+        let mut link_crates = modified_crates.clone();
+        link_crates.extend(out_of_place_crates.iter().cloned());
+
+        let attempt = self
+            .compile_workspace_hotpatch_attempt(
+                ctx,
+                replay_in_place,
+                replay_out_of_place,
+                &link_crates,
+                out_of_place_crates,
+            )
+            .await;
+
+        match attempt {
+            Ok(mut artifacts) => {
+                artifacts.replayed_in_place = replay_in_place.clone();
+                Ok(artifacts)
+            }
+            // The interface gate is a heuristic. When a gated patch fails after its replay, the
+            // gate can have missed an interface change: replay the changed crates in place with
+            // their full dependent cascade, as an ungated patch does. A failed replay is a
+            // compile error in the changed crate itself, and a cascade cannot fix it.
+            Err(err)
+                if !replay_out_of_place.is_empty()
+                    && err.downcast_ref::<ReplayFailed>().is_none() =>
+            {
+                tracing::warn!(
+                    "The gated patch for {replay_out_of_place:?} failed: {err:#}. \
+                     Retrying with the full dependent cascade."
+                );
+                let cascade = self.workspace_dependents_cascade(replay_out_of_place);
+                let mut in_place = replay_in_place.clone();
+                in_place.extend(cascade.iter().cloned());
+                let mut out_of_place = out_of_place_crates.clone();
+                for crate_name in &cascade {
+                    out_of_place.remove(crate_name);
+                }
+                let mut link_crates = modified_crates.clone();
+                link_crates.extend(cascade.iter().cloned());
+                link_crates.extend(out_of_place.iter().cloned());
+                let mut artifacts = self
+                    .compile_workspace_hotpatch_attempt(
+                        ctx,
+                        &in_place,
+                        &HashSet::new(),
+                        &link_crates,
+                        &out_of_place,
+                    )
+                    .await?;
+                artifacts.replayed_in_place = in_place;
+                Ok(artifacts)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The crates in `roots` and every workspace crate that transitively depends on one of them.
+    /// The tip crate is not part of the result.
+    fn workspace_dependents_cascade(&self, roots: &HashSet<String>) -> HashSet<String> {
+        let tip = self.tip_package_name();
+        let mut result = HashSet::new();
+        let mut to_visit: Vec<String> = roots.iter().cloned().collect();
+        while let Some(crate_name) = to_visit.pop() {
+            if crate_name == tip || !result.insert(crate_name.clone()) {
+                continue;
+            }
+            to_visit.extend(self.workspace_dependents_of(&crate_name));
+        }
+        result
+    }
+
+    /// One attempt at a thin build: replay `replay_in_place` into the cargo target directory and
+    /// `replay_out_of_place` into the dx replay directory, compile the tip, and link the patch
+    /// from the tip objects and the rlibs of `link_crates`. A crate in `out_of_place_crates`
+    /// links its out-of-place rlib.
+    async fn compile_workspace_hotpatch_attempt(
+        &self,
+        ctx: &BuildContext,
+        replay_in_place: &HashSet<String>,
+        replay_out_of_place: &HashSet<String>,
+        link_crates: &HashSet<String>,
+        out_of_place_crates: &HashSet<String>,
+    ) -> Result<BuildArtifacts> {
+        let BuildMode::Thin {
             aslr_reference,
             workspace_rustc_args,
-            modified_crates,
             cache,
             ..
         } = &ctx.mode
@@ -144,13 +248,18 @@ impl BuildRequest {
             bail!("Not thin mode!")
         };
 
-        tracing::debug!("Changed crates dag using {modified_crates:?}");
+        tracing::debug!(
+            "Replay in place {replay_in_place:?}, out of place {replay_out_of_place:?}, \
+             link {link_crates:?}, out-of-place rlibs {out_of_place_crates:?}"
+        );
 
-        // Replay the rustcs for all modified workspace crates. This is not the final tip binary.
+        // Replay the rustcs for the workspace crates of this patch. This is not the final tip binary.
         // Note that the final tip might include itself as a lib (lib.rs + main.rs) which gets covered here.
         ctx.profile_phase("Workspace hotpatch replay");
+        let mut replay_set = replay_in_place.clone();
+        replay_set.extend(replay_out_of_place.iter().cloned());
         let replay_levels =
-            self.workspace_hotpatch_replay_levels(modified_crates, workspace_rustc_args)?;
+            self.workspace_hotpatch_replay_levels(&replay_set, workspace_rustc_args)?;
         let replayed_crates: Vec<String> = replay_levels.iter().flatten().cloned().collect();
         tracing::debug!(
             "replaying {} crates in {} dependency levels: {replay_levels:?}",
@@ -168,14 +277,24 @@ impl BuildRequest {
                 let rustc_args = self
                     .workspace_hotpatch_replay_args(workspace_rustc_args, crate_name)
                     .with_context(|| format!("Missing rustc args for replay: '{crate_name}'"))?;
-                level_jobs.push((crate_name, rustc_args));
+                let out_dir = replay_out_of_place
+                    .contains(crate_name)
+                    .then(|| self.hotpatch_replay_dir(crate_name));
+                level_jobs.push((crate_name, rustc_args, out_dir));
             }
-            let level_futures = level_jobs.into_iter().map(|(crate_name, rustc_args)| async move {
-                self.compile_dep_crate(ctx, crate_name, rustc_args)
-                    .await
-                    .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))
-            });
-            futures_util::future::try_join_all(level_futures).await?;
+            let level_futures =
+                level_jobs
+                    .into_iter()
+                    .map(|(crate_name, rustc_args, out_dir)| async move {
+                        self.compile_dep_crate(ctx, crate_name, rustc_args, out_dir.as_deref())
+                            .await
+                            .with_context(|| {
+                                format!("Failed to replay workspace crate '{crate_name}'")
+                            })
+                    });
+            futures_util::future::try_join_all(level_futures)
+                .await
+                .map_err(|err| err.context(ReplayFailed))?;
         }
 
         // Recompile just the tip crate now
@@ -217,8 +336,11 @@ impl BuildRequest {
             .map(PathBuf::from)
             .collect();
 
-        let workspace_rlibs =
-            self.workspace_hotpatch_link_rlibs(&artifacts.workspace_rustc, &replayed_crates)?;
+        let workspace_rlibs = self.workspace_hotpatch_link_rlibs(
+            &artifacts.workspace_rustc,
+            link_crates,
+            out_of_place_crates,
+        )?;
 
         // Merge both sets for the linker. Merge order
         let mut object_files: Vec<PathBuf> = temp_objects.clone();
@@ -541,10 +663,20 @@ impl BuildRequest {
         ctx: &BuildContext,
         crate_name: &str,
         rustc_args: &RustcArgs,
+        out_dir: Option<&std::path::Path>,
     ) -> Result<()> {
         let mut cmd = Command::new("rustc");
         cmd.current_dir(rustc_args.cwd.clone());
         cmd.env_clear();
+
+        if let Some(out_dir) = out_dir {
+            std::fs::create_dir_all(out_dir).with_context(|| {
+                format!(
+                    "Failed to create the replay directory '{}'",
+                    out_dir.display()
+                )
+            })?;
+        }
 
         // Skip args[0] which is the rustc binary path captured by the wrapper.
         // We must also strip the dx linker override so replayed crates produce real outputs
@@ -567,6 +699,22 @@ impl BuildRequest {
             {
                 idx += 2;
                 continue;
+            }
+
+            // An out-of-place replay writes its rlib into the dx replay directory, so that the
+            // cargo target directory keeps the rlib that the dependents compiled against.
+            if let Some(out_dir) = out_dir {
+                if arg == "--out-dir" {
+                    replay_args.push(arg.clone());
+                    replay_args.push(out_dir.display().to_string());
+                    idx += 2;
+                    continue;
+                }
+                if arg.starts_with("--out-dir=") {
+                    replay_args.push(format!("--out-dir={}", out_dir.display()));
+                    idx += 1;
+                    continue;
+                }
             }
 
             replay_args.push(arg.clone());
@@ -816,7 +964,7 @@ impl BuildRequest {
 
     /// Collect the rlib paths for every replayed workspace crate, ordered for the linker.
     ///
-    /// Each crate in `replayed_crates` is resolved to its on-disk `.rlib` using the captured
+    /// Each crate in `link_crates` is resolved to its on-disk `.rlib` using the captured
     /// rustc args from the fat build (specifically `--out-dir` and `-C extra-filename`).
     /// Every crate must resolve — a missing rlib would produce a corrupted patch binary.
     ///
@@ -825,25 +973,27 @@ impl BuildRequest {
     fn workspace_hotpatch_link_rlibs(
         &self,
         args: &WorkspaceRustcArgs,
-        replayed_crates: &[String],
+        link_crates: &HashSet<String>,
+        out_of_place_crates: &HashSet<String>,
     ) -> Result<Vec<PathBuf>> {
-        // Resolve every replayed crate to its rlib path. Every crate must resolve —
-        // a missing rlib means we'd link a corrupted binary.
+        // Resolve every linked crate to its rlib path. A crate without captured `.lib` args was
+        // not in the fat build (an optional dependency behind a disabled feature) and has no
+        // rlib. Every other crate must resolve — a missing rlib means we'd link a corrupted binary.
+        let tip = self.tip_package_name();
         let mut wanted = HashSet::new();
-        for crate_name in replayed_crates {
-            let rustc_args = args
-                .rustc_args
-                .get(&format!("{crate_name}.lib"))
-                .with_context(|| {
-                    format!(
-                        "Missing captured rustc args for workspace crate '{crate_name}.lib' \
-                         (available: {:?})",
-                        args.rustc_args.keys().collect::<Vec<_>>()
-                    )
-                })?;
+        for crate_name in link_crates.iter().sorted() {
+            if *crate_name == tip {
+                continue;
+            }
+            let Some(rustc_args) = args.rustc_args.get(&format!("{crate_name}.lib")) else {
+                continue;
+            };
 
+            let out_dir = out_of_place_crates
+                .contains(crate_name)
+                .then(|| self.hotpatch_replay_dir(crate_name));
             let rlib = self
-                .find_rlib_for_crate(crate_name, rustc_args)
+                .find_rlib_for_crate(crate_name, rustc_args, out_dir)
                 .with_context(|| {
                     format!("Could not find rlib for workspace crate '{crate_name}'")
                 })?;
@@ -1472,15 +1622,25 @@ impl BuildRequest {
     /// rlib filename. This is important because multiple rlibs for the same crate can coexist
     /// in the deps directory (e.g., from different dx builds that produce different `-C metadata`),
     /// and globbing would return an arbitrary one.
-    fn find_rlib_for_crate(&self, crate_name: &str, rustc_args: &RustcArgs) -> Result<PathBuf> {
-        // Extract --out-dir from the captured args
-        let out_dir = rustc_args
-            .args
-            .iter()
-            .zip(rustc_args.args.iter().skip(1))
-            .find(|(flag, _)| *flag == "--out-dir")
-            .map(|(_, dir)| PathBuf::from(dir))
-            .with_context(|| format!("No --out-dir in captured rustc args for '{crate_name}'"))?;
+    fn find_rlib_for_crate(
+        &self,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+        out_dir_override: Option<PathBuf>,
+    ) -> Result<PathBuf> {
+        // Extract --out-dir from the captured args, unless the crate replayed out of place.
+        let out_dir = match out_dir_override {
+            Some(dir) => dir,
+            None => rustc_args
+                .args
+                .iter()
+                .zip(rustc_args.args.iter().skip(1))
+                .find(|(flag, _)| *flag == "--out-dir")
+                .map(|(_, dir)| PathBuf::from(dir))
+                .with_context(|| {
+                    format!("No --out-dir in captured rustc args for '{crate_name}'")
+                })?,
+        };
 
         // Extract -C extra-filename from captured args.
         // Cargo passes this to rustc to disambiguate output filenames via metadata hash.
@@ -1651,14 +1811,8 @@ fn dep_info_path_for_rustc_args(args: &[String]) -> Option<PathBuf> {
 /// and nothing in the patch/link flow ever reads them back. `.rcgu.o` is included because the only
 /// loose objects we link are the tip crate's *current* set, which is deleted right after the link in
 /// [`BuildRequest::compile_workspace_hotpatch`] — any `.rcgu.o` lingering at sweep time is stale.
-const THIN_BUILD_BYPRODUCT_SUFFIXES: &[&str] = &[
-    ".no-opt.bc",
-    ".opt.bc",
-    ".rcgu.bc",
-    ".rcgu.o",
-    ".ll",
-    ".s",
-];
+const THIN_BUILD_BYPRODUCT_SUFFIXES: &[&str] =
+    &[".no-opt.bc", ".opt.bc", ".rcgu.bc", ".rcgu.o", ".ll", ".s"];
 
 fn is_thin_build_byproduct(file_name: &str) -> bool {
     THIN_BUILD_BYPRODUCT_SUFFIXES

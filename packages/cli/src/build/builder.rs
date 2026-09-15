@@ -116,6 +116,15 @@ pub(crate) struct AppBuilder {
     /// Each patch includes objects from ALL crates in this set.
     pub modified_crates: HashSet<String>,
 
+    /// Workspace crates that a patch replayed out of place, because the interface gate
+    /// classified their edits as body-only. The cargo target directory keeps the rlib that the
+    /// dependents compiled against. Each patch links the out-of-place rlib instead.
+    pub out_of_place_crates: HashSet<String>,
+
+    /// Crates with an interface change that no successful patch has applied yet. A failed
+    /// patch keeps them here, so that the next patch still replays their dependents.
+    pub pending_interface_changes: HashSet<String>,
+
     /// The build profiling spans for us to generate a flamegraph from.
     pub profile_spans: Vec<BuildPhaseProfile>,
 }
@@ -174,6 +183,8 @@ impl AppBuilder {
             artifacts: None,
             pid: None,
             modified_crates: HashSet::new(),
+            out_of_place_crates: HashSet::new(),
+            pending_interface_changes: HashSet::new(),
             profile_spans: Vec::new(),
         })
     }
@@ -323,6 +334,14 @@ impl AppBuilder {
                 self.bundling_progress = 1.0;
                 self.stage = BuildStage::Success;
 
+                // The patch applied every pending interface change. A fallback inside the
+                // patch can promote out-of-place crates to the in-place cascade.
+                self.pending_interface_changes.clear();
+                for crate_name in &bundle.replayed_in_place {
+                    self.modified_crates.insert(crate_name.clone());
+                    self.out_of_place_crates.remove(crate_name);
+                }
+
                 self.bundle_end = Some(SystemTime::now());
                 if self.compile_end.is_none() {
                     self.compiled_crates = self.expected_crates;
@@ -373,6 +392,7 @@ impl AppBuilder {
         &mut self,
         changed_files: Vec<PathBuf>,
         changed_crates: Vec<String>,
+        interface_changed_crates: HashSet<String>,
         build_id: BuildId,
     ) {
         // We need the rustc args from the original build to pass to the new build
@@ -421,25 +441,61 @@ impl AppBuilder {
         let tip_crate_name = self.build.tip_package_name();
         self.modified_crates.insert(tip_crate_name.clone());
 
-        // Add changed crates and their transitive workspace dependents (cascade).
-        let mut to_visit: Vec<String> = changed_crates.clone();
+        // The interface gate. A crate with a body-only edit replays alone, out of place. A crate
+        // with an interface change replays in place, with every workspace crate that depends on
+        // it. `DX_INTERFACE_GATE=0` turns the gate off, and every edit counts as an interface
+        // change.
+        let gate_enabled = std::env::var("DX_INTERFACE_GATE")
+            .ok()
+            .is_none_or(|v| v != "0");
+        let mut interface_changed: HashSet<String> = if gate_enabled {
+            interface_changed_crates
+        } else {
+            changed_crates.iter().cloned().collect()
+        };
+        interface_changed.extend(self.pending_interface_changes.iter().cloned());
+        self.pending_interface_changes = interface_changed.clone();
+
+        // Add the interface-changed crates and their transitive workspace dependents (cascade).
+        let mut replay_in_place: HashSet<String> = HashSet::new();
+        let mut to_visit: Vec<String> = interface_changed.iter().cloned().collect();
         let mut visited = HashSet::new();
         while let Some(c) = to_visit.pop() {
             if !visited.insert(c.clone()) {
                 continue;
             }
             self.modified_crates.insert(c.clone());
+            if c != tip_crate_name {
+                replay_in_place.insert(c.clone());
+            }
             for dep in self.build.workspace_dependents_of(&c) {
                 if dep != tip_crate_name && !visited.contains(&dep) {
                     to_visit.push(dep);
                 }
             }
         }
+        for c in &replay_in_place {
+            self.out_of_place_crates.remove(c);
+        }
+
+        // Every other changed crate replays out of place.
+        let replay_out_of_place: HashSet<String> = changed_crates
+            .iter()
+            .filter(|c| **c != tip_crate_name && !replay_in_place.contains(*c))
+            .cloned()
+            .collect();
+        self.out_of_place_crates
+            .extend(replay_out_of_place.iter().cloned());
 
         tracing::debug!(
-            "Patch rebuild: changed_crates={:?}, modified_crates={:?}",
+            "Patch rebuild: changed_crates={:?}, interface_changed={:?}, replay_in_place={:?}, \
+             replay_out_of_place={:?}, modified_crates={:?}, out_of_place_crates={:?}",
             changed_crates,
+            interface_changed,
+            replay_in_place,
+            replay_out_of_place,
             self.modified_crates,
+            self.out_of_place_crates,
         );
 
         // Abort all the ongoing builds, cleaning up any loose artifacts and waiting to cleanly exit
@@ -453,6 +509,9 @@ impl AppBuilder {
                 BuildMode::Thin {
                     changed_files,
                     modified_crates: self.modified_crates.clone(),
+                    replay_in_place,
+                    replay_out_of_place,
+                    out_of_place_crates: self.out_of_place_crates.clone(),
                     workspace_rustc_args: artifacts.workspace_rustc,
                     aslr_reference,
                     cache,
@@ -472,6 +531,8 @@ impl AppBuilder {
 
         // A full rebuild resets all accumulated hotpatch state — the fat binary is a clean baseline.
         self.modified_crates.clear();
+        self.out_of_place_crates.clear();
+        self.pending_interface_changes.clear();
         self.profile_spans.clear();
         self.build_task = tokio::spawn({
             let request = self.build.clone();

@@ -413,6 +413,10 @@ impl AppServer {
         // when this is true.
         let mut needs_deep_rebuild = false;
 
+        // Files whose edit the interface gate classified as body-only. Their crate replays
+        // alone. Every other changed file counts as an interface change of its crate.
+        let mut body_only_files: HashSet<PathBuf> = HashSet::new();
+
         // We attempt to hotreload rsx blocks without a full rebuild
         for path in files {
             // for various assets that might be linked in, we just try to hotreloading them forcefully
@@ -509,6 +513,17 @@ impl AppServer {
 
                 // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
                 cached_file.most_recent = Some(new_contents);
+
+                match crate::build::interface_change(&old_file, &new_file) {
+                    None => {
+                        body_only_files.insert(path.clone());
+                    }
+                    Some(reason) => tracing::info!(
+                        dx_src = ?TraceSrc::Dev,
+                        "Interface change in {}: {reason}. The dependents of its crate replay too.",
+                        local_path.display()
+                    ),
+                }
 
                 // This assumes the two files are structured similarly. If they're not, we can't diff them
                 let Some(changed_rsx) = dioxus_rsx_hotreload::diff_rsx(&new_file, &old_file) else {
@@ -659,15 +674,26 @@ impl AppServer {
                 // Otherwise hotpatches go through patching system
                 HotReloadMode::Hotpatch => {
                     let changed_crates = self.order_changed_crates(files);
+                    let interface_changed_crates: HashSet<String> = files
+                        .iter()
+                        .filter(|file| !body_only_files.contains(*file))
+                        .filter_map(|file| self.file_to_workspace_crate(file))
+                        .collect();
 
                     self.client.patch_rebuild(
                         files.to_vec(),
                         changed_crates.clone(),
+                        interface_changed_crates.clone(),
                         BuildId::PRIMARY,
                     );
 
                     if let Some(server) = self.server.as_mut() {
-                        server.patch_rebuild(files.to_vec(), changed_crates, BuildId::SECONDARY);
+                        server.patch_rebuild(
+                            files.to_vec(),
+                            changed_crates,
+                            interface_changed_crates,
+                            BuildId::SECONDARY,
+                        );
                     }
                     // The applied templates stay until the patch lands, for the same reason as
                     // the fat path above: a tab that opens during the patch build gets the old

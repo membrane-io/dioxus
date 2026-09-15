@@ -314,6 +314,17 @@ pub enum BuildMode {
         /// Cumulative set of all workspace crates modified since the fat build.
         modified_crates: HashSet<String>,
 
+        /// Crates that this patch replays in place, into the cargo target directory: the crates
+        /// with an interface change and their workspace dependents.
+        replay_in_place: HashSet<String>,
+
+        /// Crates that this patch replays out of place, because their edit is body-only.
+        replay_out_of_place: HashSet<String>,
+
+        /// Every crate whose latest rlib lives out of place. The patch links these rlibs instead
+        /// of the ones in the cargo target directory.
+        out_of_place_crates: HashSet<String>,
+
         /// Cache of initial binary parsing which speeds up stub creation
         cache: Arc<HotpatchModuleCache>,
     },
@@ -337,6 +348,10 @@ pub struct BuildArtifacts {
     pub(crate) patch_cache: Option<Arc<HotpatchModuleCache>>,
     pub(crate) depinfo: RustcDepInfo,
     pub(crate) build_id: BuildId,
+
+    /// The workspace crates that a thin build replayed in place. The builder adds them to its
+    /// cumulative set, so that a fallback inside the patch is not lost.
+    pub(crate) replayed_in_place: HashSet<String>,
 }
 
 impl BuildRequest {
@@ -1213,6 +1228,7 @@ impl BuildRequest {
             root_dir: self.root_dir(),
             patch_cache: None,
             build_id: ctx.build_id,
+            replayed_in_place: HashSet::new(),
         })
     }
 
@@ -2586,6 +2602,11 @@ impl BuildRequest {
             .join(&self.main_target)
             .join(if self.release { "release" } else { "debug" })
             .join(self.bundle.build_folder_name())
+    }
+
+    /// The directory that holds the rlib of a workspace crate that a patch replayed out of place.
+    pub(crate) fn hotpatch_replay_dir(&self, crate_name: &str) -> PathBuf {
+        self.platform_dir().join("hotpatch-replay").join(crate_name)
     }
 
     pub(crate) fn platform_exe_name(&self) -> String {
