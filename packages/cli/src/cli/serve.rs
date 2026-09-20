@@ -60,6 +60,20 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_missing_value = "true", num_args=0..=1, alias = "hotpatch")]
     pub(crate) hot_patch: Option<bool>,
 
+    /// Replay only the changed crate on a body-only edit [default: true]
+    ///
+    /// With `false`, every edit replays the changed crate and all of its workspace dependents.
+    /// The `s` key toggles the flag in the TUI.
+    #[clap(long, default_missing_value = "true", num_args=0..=1)]
+    pub(crate) skip_dependents: Option<bool>,
+
+    /// Compile the skipped dependents in the background after each patch and compare their
+    /// objects with a compile against the new rlibs [default: false]
+    ///
+    /// A difference means that the interface gate missed an exported body. dx logs a warning.
+    #[clap(long)]
+    pub(crate) verify_skip_dependents: bool,
+
     /// Watch the filesystem for changes and trigger a rebuild [default: true]
     #[clap(long, default_missing_value = "true", num_args=0..=1)]
     pub(crate) watch: Option<bool>,

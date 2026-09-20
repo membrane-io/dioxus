@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
-use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache};
+use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache, TipObjects};
 
 /// How many hot-patches to apply between sweeps of leftover rustc `save-temps` byproducts.
 ///
@@ -125,6 +125,12 @@ pub(crate) struct AppBuilder {
     /// patch keeps them here, so that the next patch still replays their dependents.
     pub pending_interface_changes: HashSet<String>,
 
+    /// The artifacts of the last thin build that compiled the tip. A patch that does not change
+    /// the tip and replays nothing in place links the tip objects of this build again. The
+    /// builder clears it when a patch needs a fresh tip compile, so that a failed patch cannot
+    /// leave stale objects in the cache.
+    pub last_thin_artifacts: Option<BuildArtifacts>,
+
     /// The build profiling spans for us to generate a flamegraph from.
     pub profile_spans: Vec<BuildPhaseProfile>,
 }
@@ -185,6 +191,7 @@ impl AppBuilder {
             modified_crates: HashSet::new(),
             out_of_place_crates: HashSet::new(),
             pending_interface_changes: HashSet::new(),
+            last_thin_artifacts: None,
             profile_spans: Vec::new(),
         })
     }
@@ -342,6 +349,28 @@ impl AppBuilder {
                     self.out_of_place_crates.remove(crate_name);
                 }
 
+                if let BuildMode::Thin {
+                    verify_skipped,
+                    workspace_rustc_args,
+                    ..
+                } = &bundle.mode
+                {
+                    self.last_thin_artifacts = Some(bundle.clone());
+
+                    if *verify_skipped && !self.out_of_place_crates.is_empty() {
+                        let request = self.build.clone();
+                        let args = workspace_rustc_args.clone();
+                        let out_of_place = self.out_of_place_crates.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) =
+                                request.verify_skipped_dependents(args, out_of_place).await
+                            {
+                                tracing::warn!("The verify pass of the skipped dependents failed: {err:#}");
+                            }
+                        });
+                    }
+                }
+
                 self.bundle_end = Some(SystemTime::now());
                 if self.compile_end.is_none() {
                     self.compiled_crates = self.expected_crates;
@@ -393,6 +422,7 @@ impl AppBuilder {
         changed_files: Vec<PathBuf>,
         changed_crates: Vec<String>,
         interface_changed_crates: HashSet<String>,
+        verify_skipped: bool,
         build_id: BuildId,
     ) {
         // We need the rustc args from the original build to pass to the new build
@@ -491,6 +521,14 @@ impl AppBuilder {
             self.out_of_place_crates,
         );
 
+        // A tip edit or an in-place replay needs a fresh tip compile. Drop the cached tip
+        // objects now, so that a patch that fails after this point cannot reuse them.
+        let tip_changed = changed_crates.iter().any(|name| *name == tip_crate_name);
+        if tip_changed || !replay_in_place.is_empty() {
+            self.last_thin_artifacts = None;
+        }
+        let previous_tip = self.last_thin_artifacts.as_ref().map(TipObjects::from);
+
         // Abort all the ongoing builds, cleaning up any loose artifacts and waiting to cleanly exit
         self.abort_all(BuildStage::Restarting);
         self.compile_start = Some(SystemTime::now());
@@ -505,6 +543,8 @@ impl AppBuilder {
                     replay_in_place,
                     replay_out_of_place,
                     out_of_place_crates: self.out_of_place_crates.clone(),
+                    previous_tip,
+                    verify_skipped,
                     workspace_rustc_args: artifacts.workspace_rustc,
                     aslr_reference,
                     cache,
@@ -526,6 +566,7 @@ impl AppBuilder {
         self.modified_crates.clear();
         self.out_of_place_crates.clear();
         self.pending_interface_changes.clear();
+        self.last_thin_artifacts = None;
         self.profile_spans.clear();
         self.build_task = tokio::spawn({
             let request = self.build.clone();

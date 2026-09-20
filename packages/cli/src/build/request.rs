@@ -325,9 +325,39 @@ pub enum BuildMode {
         /// of the ones in the cargo target directory.
         out_of_place_crates: HashSet<String>,
 
+        /// The tip objects of the previous patch. The builder sets this when the tip did not
+        /// change since that patch. The thin build links these objects instead of a new tip
+        /// compile, unless a crate replays in place.
+        previous_tip: Option<TipObjects>,
+
+        /// When true, the builder compiles the skipped dependents in the background after the
+        /// patch and compares their objects. See `BuildRequest::verify_skipped_dependents`.
+        verify_skipped: bool,
+
         /// Cache of initial binary parsing which speeds up stub creation
         cache: Arc<HotpatchModuleCache>,
     },
+}
+
+/// The outputs of a tip compile that a later patch can link again.
+///
+/// The thin build moves the `.rcgu.o` files of the tip into `hotpatch_tip_dir` after the link,
+/// and `link_args` names them at that location.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TipObjects {
+    pub(crate) exe: PathBuf,
+    pub(crate) link_args: Vec<String>,
+    pub(crate) depinfo: RustcDepInfo,
+}
+
+impl From<&BuildArtifacts> for TipObjects {
+    fn from(artifacts: &BuildArtifacts) -> Self {
+        Self {
+            exe: artifacts.exe.clone(),
+            link_args: artifacts.workspace_rustc.link_args.clone(),
+            depinfo: artifacts.depinfo.clone(),
+        }
+    }
 }
 
 /// The end result of a build.
@@ -2607,6 +2637,16 @@ impl BuildRequest {
     /// The directory that holds the rlib of a workspace crate that a patch replayed out of place.
     pub(crate) fn hotpatch_replay_dir(&self, crate_name: &str) -> PathBuf {
         self.platform_dir().join("hotpatch-replay").join(crate_name)
+    }
+
+    /// The directory that holds the tip objects of the last patch, for the next patch to link.
+    pub(crate) fn hotpatch_tip_dir(&self) -> PathBuf {
+        self.platform_dir().join("hotpatch-tip")
+    }
+
+    /// The directory of one verify pass. See `verify_skipped_dependents`.
+    pub(crate) fn hotpatch_verify_dir(&self, pass: &str) -> PathBuf {
+        self.platform_dir().join("hotpatch-verify").join(pass)
     }
 
     pub(crate) fn platform_exe_name(&self) -> String {

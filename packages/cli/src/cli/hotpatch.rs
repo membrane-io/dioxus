@@ -89,6 +89,8 @@ impl HotpatchTip {
             replay_in_place: std::collections::HashSet::new(),
             replay_out_of_place: std::collections::HashSet::new(),
             out_of_place_crates: std::collections::HashSet::new(),
+            previous_tip: None,
+            verify_skipped: false,
             aslr_reference: self.aslr_reference,
             cache: cache.clone(),
         };

@@ -60,6 +60,9 @@ pub(crate) struct AppServer {
     /// When true, a body-only edit replays only its own crate. When false, every edit replays
     /// the changed crate and all of its workspace dependents.
     pub(crate) skip_dependents: bool,
+    /// When true, a background pass compiles the skipped dependents after each patch and
+    /// compares their objects. See `BuildRequest::verify_skipped_dependents`.
+    pub(crate) verify_skip_dependents: bool,
     pub(crate) interactive: bool,
     pub(crate) _force_sequential: bool,
     pub(crate) open_browser: bool,
@@ -212,7 +215,8 @@ impl AppServer {
             applied_client_hot_reload_message: Default::default(),
             watch_fs,
             hotreload_mode,
-            skip_dependents: true,
+            skip_dependents: args.skip_dependents.unwrap_or(true),
+            verify_skip_dependents: args.verify_skip_dependents,
             client,
             server,
             open_browser,
@@ -690,6 +694,7 @@ impl AppServer {
                         files.to_vec(),
                         changed_crates.clone(),
                         interface_changed_crates.clone(),
+                        self.verify_skip_dependents,
                         BuildId::PRIMARY,
                     );
 
@@ -698,6 +703,7 @@ impl AppServer {
                             files.to_vec(),
                             changed_crates,
                             interface_changed_crates,
+                            self.verify_skip_dependents,
                             BuildId::SECONDARY,
                         );
                     }
