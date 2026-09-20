@@ -170,6 +170,7 @@ impl RunArgs {
                 ServeUpdate::OpenApp => {}
                 ServeUpdate::RequestRebuild => {}
                 ServeUpdate::CycleHotreloadMode => {}
+                ServeUpdate::ToggleSkipDependents => {}
                 ServeUpdate::OpenDebugger { .. } => {}
                 ServeUpdate::Redraw => {}
                 ServeUpdate::TracingLog { .. } => {}

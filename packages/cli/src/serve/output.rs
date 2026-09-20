@@ -32,8 +32,8 @@ use super::{AppServer, HotReloadMode};
 
 const TICK_RATE_MS: u64 = 100;
 const VIEWPORT_MAX_WIDTH: u16 = 92;
-const VIEWPORT_HEIGHT_SMALL: u16 = 5;
-const VIEWPORT_HEIGHT_BIG: u16 = 14;
+const VIEWPORT_HEIGHT_SMALL: u16 = 6;
+const VIEWPORT_HEIGHT_BIG: u16 = 16;
 
 /// The TUI that drives the console output.
 ///
@@ -255,6 +255,7 @@ impl Output {
             KeyCode::Char('r') => return Ok(Some(ServeUpdate::RequestRebuild)),
             KeyCode::Char('o') => return Ok(Some(ServeUpdate::OpenApp)),
             KeyCode::Char('p') => return Ok(Some(ServeUpdate::CycleHotreloadMode)),
+            KeyCode::Char('s') => return Ok(Some(ServeUpdate::ToggleSkipDependents)),
             KeyCode::Char('v') => {
                 self.verbose = !self.verbose;
                 tracing::info!(
@@ -701,12 +702,14 @@ impl Output {
     }
 
     fn render_stats(&self, frame: &mut Frame<'_>, area: Rect, state: RenderState) {
-        let [current_platform, hotreload_mode, serve_address]: [_; 3] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .areas(area);
+        let [current_platform, hotreload_mode, serve_address, skip_dependents]: [_; 4] =
+            Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(area);
 
         let client = &state.runner.client();
         frame.render_widget(
@@ -752,6 +755,15 @@ impl Output {
         frame.render_widget_ref(
             Paragraph::new(Line::from(vec!["Address:  ".gray(), address])),
             serve_address,
+        );
+
+        let (label, indicator) = match state.runner.skip_dependents {
+            true => ("skip unaffected".yellow(), " ✓".yellow()),
+            false => ("replay all".dark_gray(), " ✗".dark_gray()),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec!["Dependents: ".gray(), label, indicator])),
+            skip_dependents,
         );
     }
 
@@ -843,13 +855,14 @@ impl Output {
             "r: rebuild the app",
             "o: open the app",
             "p: cycle hotreload mode",
+            "s: toggle skip of dependents",
             "v: toggle verbose logs",
             "t: toggle tracing logs",
             "c: clear the screen",
             "d: attach debugger",
             "/: toggle more commands",
         ];
-        let layout: [_; 9] = Layout::vertical(cmds.iter().map(|_| Constraint::Length(1)))
+        let layout: [_; 10] = Layout::vertical(cmds.iter().map(|_| Constraint::Length(1)))
             .horizontal_margin(1)
             .areas(col2);
         for (idx, cmd) in cmds.iter().enumerate() {

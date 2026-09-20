@@ -57,6 +57,9 @@ pub(crate) struct AppServer {
 
     // Resolved args related to how we go about processing the rebuilds and logging
     pub(crate) hotreload_mode: HotReloadMode,
+    /// When true, a body-only edit replays only its own crate. When false, every edit replays
+    /// the changed crate and all of its workspace dependents.
+    pub(crate) skip_dependents: bool,
     pub(crate) interactive: bool,
     pub(crate) _force_sequential: bool,
     pub(crate) open_browser: bool,
@@ -209,6 +212,7 @@ impl AppServer {
             applied_client_hot_reload_message: Default::default(),
             watch_fs,
             hotreload_mode,
+            skip_dependents: true,
             client,
             server,
             open_browser,
@@ -674,9 +678,11 @@ impl AppServer {
                 // Otherwise hotpatches go through patching system
                 HotReloadMode::Hotpatch => {
                     let changed_crates = self.order_changed_crates(files);
+                    // With `skip_dependents` off, every edit counts as an interface change, so
+                    // the builder replays the full dependent cascade.
                     let interface_changed_crates: HashSet<String> = files
                         .iter()
-                        .filter(|file| !body_only_files.contains(*file))
+                        .filter(|file| !self.skip_dependents || !body_only_files.contains(*file))
                         .filter_map(|file| self.file_to_workspace_crate(file))
                         .collect();
 

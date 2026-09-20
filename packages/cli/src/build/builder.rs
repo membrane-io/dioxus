@@ -443,16 +443,9 @@ impl AppBuilder {
 
         // The interface gate. A crate with a body-only edit replays alone, out of place. A crate
         // with an interface change replays in place, with every workspace crate that depends on
-        // it. `DX_INTERFACE_GATE=0` turns the gate off, and every edit counts as an interface
-        // change.
-        let gate_enabled = std::env::var("DX_INTERFACE_GATE")
-            .ok()
-            .is_none_or(|v| v != "0");
-        let mut interface_changed: HashSet<String> = if gate_enabled {
-            interface_changed_crates
-        } else {
-            changed_crates.iter().cloned().collect()
-        };
+        // it. The runner decides which crates count as interface-changed; with "skip dependents"
+        // off it passes every changed crate.
+        let mut interface_changed: HashSet<String> = interface_changed_crates;
         interface_changed.extend(self.pending_interface_changes.iter().cloned());
         self.pending_interface_changes = interface_changed.clone();
 

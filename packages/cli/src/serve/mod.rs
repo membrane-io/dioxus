@@ -341,6 +341,19 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 );
             }
 
+            ServeUpdate::ToggleSkipDependents => {
+                builder.skip_dependents = !builder.skip_dependents;
+                tracing::info!(
+                    "Skip dependents is now {}. {}",
+                    if builder.skip_dependents { "on" } else { "off" },
+                    if builder.skip_dependents {
+                        "A body-only edit replays only its own crate."
+                    } else {
+                        "Every edit replays the changed crate and all of its dependents."
+                    }
+                );
+            }
+
             ServeUpdate::OpenDebugger { id } => {
                 builder.open_debugger(&devserver, id).await;
             }

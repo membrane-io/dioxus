@@ -33,6 +33,8 @@ pub(crate) enum ServeUpdate {
 
     CycleHotreloadMode,
 
+    ToggleSkipDependents,
+
     OpenDebugger {
         id: BuildId,
     },
