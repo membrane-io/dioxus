@@ -15,6 +15,7 @@
 //! source of truth is the read-out of the link args after the initial build
 
 use super::HotpatchModuleCache;
+use crate::build::patch::PatchIfuncs;
 use crate::{BuildArtifacts, BuildMode, TipObjects, WorkspaceRustcArgs};
 use crate::{BuildContext, Error, LinkerFlavor, Result, RustcArgs, Workspace};
 use crate::{BuildRequest, DX_RUSTC_WRAPPER_ENV_VAR};
@@ -1888,11 +1889,14 @@ impl BuildRequest {
         Ok(())
     }
 
+    /// Build the jump table of a patch. `previous` holds the table slots of the last patch of
+    /// the session on wasm, and the result carries the slots of this patch for the next call.
     pub(crate) fn create_jump_table(
         &self,
         patch: &Path,
         cache: &HotpatchModuleCache,
-    ) -> Result<JumpTable> {
+        previous: Option<&PatchIfuncs>,
+    ) -> Result<(JumpTable, Option<PatchIfuncs>)> {
         use crate::build::patch::{
             create_native_jump_table, create_wasm_jump_table, create_windows_jump_table,
         };
@@ -1905,10 +1909,19 @@ impl BuildRequest {
         // - Wasm requires the walrus crate and actually modifies the patch file
         // - windows requires the pdb crate and pdb files
         // - nix requires the object crate
+        let mut ifuncs = None;
         let mut jump_table = match triple.operating_system {
             OperatingSystem::Windows => create_windows_jump_table(patch, cache)?,
             _ if triple.architecture == Architecture::Wasm32 => {
-                create_wasm_jump_table(patch, cache, self.keep_wasm_names(), self.dwarf_sidecar)?
+                let (table, patch_ifuncs) = create_wasm_jump_table(
+                    patch,
+                    cache,
+                    self.keep_wasm_names(),
+                    self.dwarf_sidecar,
+                    previous,
+                )?;
+                ifuncs = patch_ifuncs;
+                table
             }
             _ => create_native_jump_table(patch, triple, cache)?,
         };
@@ -1930,7 +1943,7 @@ impl BuildRequest {
             }
         }
 
-        Ok(jump_table)
+        Ok((jump_table, ifuncs))
     }
 
     /// Automatically detect the linker flavor based on the target triple and any custom linkers.

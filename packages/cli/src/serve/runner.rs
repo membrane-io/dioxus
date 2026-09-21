@@ -425,7 +425,13 @@ impl AppServer {
         // alone. Every other changed file counts as an interface change of its crate.
         let mut body_only_files: HashSet<PathBuf> = HashSet::new();
 
-        // We attempt to hotreload rsx blocks without a full rebuild
+        // We attempt to hotreload rsx blocks without a full rebuild.
+        //
+        // The loop visits every file of the batch, also after one file asks for a rust
+        // rebuild. Each rust file records its new content in the file map and gets its
+        // interface gate result. A file that the loop skips keeps its old content in the
+        // file map, so a later edit that restores that content looks like no change, and
+        // the gate compares a later edit against the wrong content.
         for path in files {
             // for various assets that might be linked in, we just try to hotreloading them forcefully
             // That is, unless they appear in an include! macro, in which case we need to a full rebuild....
@@ -513,7 +519,7 @@ impl AppServer {
                 let (Ok(old_file), Ok(new_file)) = (old_syn, new_syn) else {
                     if self.client.stage == BuildStage::Failed {
                         needs_rust_rebuild = true;
-                        break;
+                        continue;
                     }
                     tracing::debug!("Diff rsx returned not parseable");
                     continue;
@@ -544,7 +550,7 @@ impl AppServer {
                         continue;
                     }
                     needs_rust_rebuild = true;
-                    break;
+                    continue;
                 };
 
                 for ChangedRsx { old, new } in changed_rsx {
@@ -581,7 +587,7 @@ impl AppServer {
                             break;
                         }
                         needs_rust_rebuild = true;
-                        break;
+                        continue;
                     };
 
                     // Only send down templates that have roots, and ideally ones that have changed
@@ -616,7 +622,7 @@ impl AppServer {
                     // Check if the path is directly in depinfo
                     if artifacts.depinfo.files.contains(path) {
                         needs_rust_rebuild = true;
-                        break;
+                        continue;
                     }
                     // Also check if the path is under a directory that's in depinfo
                     // (for directories added via cargo:rerun-if-changed=dir)
@@ -947,9 +953,11 @@ impl AppServer {
     pub(crate) fn commit_rebuilt_artifact(&mut self, id: BuildId) {
         if id == BuildId::PRIMARY {
             self.client.patches.clear();
+            self.client.previous_patch_ifuncs = None;
             self.clear_hot_reload_changes();
         } else if let Some(server) = self.server.as_mut() {
             server.patches.clear();
+            server.previous_patch_ifuncs = None;
         }
     }
 

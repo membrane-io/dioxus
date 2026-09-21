@@ -26,6 +26,7 @@ use tokio::{
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::{BuildContext, BuildId, BuildMode, HotpatchModuleCache, TipObjects};
+use crate::build::patch::PatchIfuncs;
 
 /// How many hot-patches to apply between sweeps of leftover rustc `save-temps` byproducts.
 ///
@@ -74,6 +75,10 @@ pub(crate) struct AppBuilder {
 
     /// The list of patches applied to the app, used to know which ones to reapply and/or iterate from.
     pub patches: Vec<JumpTable>,
+
+    /// (wasm) The table slots of the last patch, so that the next jump table repoints the
+    /// region of the last patch too. See `JumpTable::previous_patch`.
+    pub previous_patch_ifuncs: Option<PatchIfuncs>,
 
     /// The virtual directory that assets will be served from
     /// Used mostly for apk/ipa builds since they live in simulator
@@ -170,6 +175,7 @@ impl AppBuilder {
             tx,
             rx,
             patches: vec![],
+            previous_patch_ifuncs: None,
             compiled_crates: 0,
             expected_crates: 1,
             bundling_progress: 0.0,
@@ -966,7 +972,10 @@ impl AppBuilder {
 
         tracing::debug!("Patching {} -> {}", original.display(), new.display());
 
-        let mut jump_table = self.build.create_jump_table(&new, cache)?;
+        let (mut jump_table, ifuncs) =
+            self.build
+                .create_jump_table(&new, cache, self.previous_patch_ifuncs.as_ref())?;
+        self.previous_patch_ifuncs = ifuncs;
 
         // If it's android, we need to copy the assets to the device and then change the location of the patch
         if self.build.bundle == BundleFormat::Android {

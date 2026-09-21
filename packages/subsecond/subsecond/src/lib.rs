@@ -867,12 +867,61 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
                 repoint_applied += 1;
             }
         }
+
+        // The region of the previous patch. Its slots hold the functions of the previous
+        // module, and the vtables in the data of that patch point at them. Every slot with a
+        // match in this patch moves to the new function. Then every slot of an older patch
+        // region that holds one of those functions moves too, so that a chain of patches does
+        // not keep the middle modules alive. A slot with no match keeps its function, and
+        // that keeps the previous module alive. The base region needs no scan: the base pairs
+        // above cover it.
+        let mut previous_repointed = 0usize;
+        let mut older_repointed = 0usize;
+        let mut previous_pairs = 0usize;
+        LAST_PATCH.with(|last| {
+            let mut last = last.borrow_mut();
+            let first_base = last.as_ref().map_or(table_base, |l| l.first_base);
+            if let (Some(prev), Some(applied)) = (&table.previous_patch, last.as_ref()) {
+                if applied.lib == prev.lib {
+                    previous_pairs = prev.repoint.len();
+                    let replaced = js_sys::Map::new();
+                    for &(old_rel, new_rel) in prev.repoint.iter() {
+                        let old_slot = applied.table_base + old_rel as u32;
+                        let new_slot = table_base + new_rel as u32;
+                        if let (Ok(old_func), Ok(new_func)) =
+                            (funcs.get(old_slot), funcs.get(new_slot))
+                        {
+                            replaced.set(&old_func, &new_func);
+                            let _ = funcs.set(old_slot, &new_func);
+                            previous_repointed += 1;
+                        }
+                    }
+                    for slot in first_base..applied.table_base {
+                        let Ok(func) = funcs.get(slot) else {
+                            continue;
+                        };
+                        let new_func = replaced.get(&func);
+                        if !new_func.is_undefined() {
+                            let _ = funcs.set(slot, new_func.unchecked_ref());
+                            older_repointed += 1;
+                        }
+                    }
+                    retire_module(&applied.module);
+                }
+            }
+            *last = Some(AppliedPatch {
+                lib: table.lib.clone(),
+                table_base,
+                first_base,
+                module: module.clone(),
+            });
+        });
         let t_done = js_sys::Date::now();
 
         let name = path.rsplit('/').next().unwrap_or(path);
         web_sys::console::log_1(
             &format!(
-                "[subsecond] applied {} ({:.1} MB): headers={:.0}ms stream+compile={:.0}ms instantiate={:.0}ms reloc={:.0}ms repoint={:.0}ms total={:.0}ms | map={} repoint={}/{} table_base={}",
+                "[subsecond] applied {} ({:.1} MB): headers={:.0}ms stream+compile={:.0}ms instantiate={:.0}ms reloc={:.0}ms repoint={:.0}ms total={:.0}ms | map={} repoint={}/{} previous={}/{} older={} table_base={}",
                 name,
                 byte_len as f64 / (1024.0 * 1024.0),
                 t_fetched - t_start,
@@ -884,6 +933,9 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
                 table.map.len(),
                 repoint_applied,
                 table.ifunc_repoint.len(),
+                previous_repointed,
+                previous_pairs,
+                older_repointed,
                 table_base,
             )
             .into(),
@@ -907,23 +959,62 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
     Ok(())
 }
 
-/// Fetch the DWARF sidecar of a patch and attach it to the patch module through
-/// `wasmStackTrace.attachSidecar`, the hook of the wasm-stack-trace library. Stack traces
-/// and the DWARF inspector then read the DWARF of the patch from the sidecar. Without the
-/// hook, the page has no use for the sidecar, and the fetch does not start.
+/// The last patch that this tab applied. The next patch repoints the region of this patch.
+#[cfg(target_arch = "wasm32")]
+struct AppliedPatch {
+    lib: std::path::PathBuf,
+    /// The first slot of the region of this patch in the shared table.
+    table_base: u32,
+    /// The first slot of the region of the first patch: the end of the base region.
+    first_base: u32,
+    module: js_sys::WebAssembly::Module,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static LAST_PATCH: std::cell::RefCell<Option<AppliedPatch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The method `name` of the `wasmStackTrace` hook, the hook of the wasm-stack-trace library,
+/// or `None` when the page did not install it or the hook has no such method.
+#[cfg(target_arch = "wasm32")]
+fn stack_trace_hook(name: &str) -> Option<(wasm_bindgen::JsValue, js_sys::Function)> {
+    use js_sys::{Function, Reflect};
+    use wasm_bindgen::{JsCast, JsValue};
+
+    let hook = Reflect::get(&js_sys::global(), &JsValue::from_str("wasmStackTrace")).ok()?;
+    let method = Reflect::get(&hook, &JsValue::from_str(name))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
+    Some((hook, method))
+}
+
+/// Tell the page that a newer patch replaced `module`. The DWARF inspector then drops its
+/// copy of the bytes of that module.
+#[cfg(target_arch = "wasm32")]
+fn retire_module(module: &js_sys::WebAssembly::Module) {
+    if let Some((hook, retire)) = stack_trace_hook("retireModule") {
+        let _ = retire.call1(&hook, module.as_ref());
+    }
+}
+
+/// Attach the DWARF sidecar of a patch to the patch module through `wasmStackTrace`, the
+/// hook of the wasm-stack-trace library. Stack traces and the DWARF inspector then read the
+/// DWARF of the patch from the sidecar. A page with `attachSidecarUrl` fetches the sidecar
+/// on the first stack trace of the patch, not before. An older page gets the bytes from a
+/// fetch here. Without the hook, the page has no use for the sidecar, and the fetch does not
+/// start.
 #[cfg(target_arch = "wasm32")]
 fn attach_dwarf_sidecar(module: js_sys::WebAssembly::Module, url: String) {
-    use js_sys::{Function, Reflect};
     use wasm_bindgen::{JsCast, JsValue, UnwrapThrowExt};
     use wasm_bindgen_futures::JsFuture;
 
-    let Ok(hook) = Reflect::get(&js_sys::global(), &JsValue::from_str("wasmStackTrace")) else {
+    if let Some((hook, attach_url)) = stack_trace_hook("attachSidecarUrl") {
+        let _ = attach_url.call2(&hook, module.as_ref(), &JsValue::from_str(&url));
         return;
-    };
-    let Some(attach) = Reflect::get(&hook, &JsValue::from_str("attachSidecar"))
-        .ok()
-        .and_then(|method| method.dyn_into::<Function>().ok())
-    else {
+    }
+    let Some((hook, attach)) = stack_trace_hook("attachSidecar") else {
         return;
     };
 

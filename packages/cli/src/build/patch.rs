@@ -445,6 +445,7 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         ifunc_count: 0,
         dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
+        previous_patch: None,
         wasm: None,
         base_id: None,
     })
@@ -500,6 +501,7 @@ pub fn create_native_jump_table(
         ifunc_count: 0,
         dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
+        previous_patch: None,
         wasm: None,
         base_id: None,
     })
@@ -531,12 +533,25 @@ pub fn create_native_jump_table(
 /// the import object can't help and a real code-section edit is unavoidable.
 ///
 /// <https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md>
+/// The functions that a patch put into the shared table: the name and the signature of each
+/// slot of its region. dx keeps this for the last patch of a session, so that the next patch
+/// can repoint the region of the last patch too. See `JumpTable::previous_patch`.
+#[derive(Debug, Clone)]
+pub struct PatchIfuncs {
+    pub lib: PathBuf,
+    pub name_to_ifunc: HashMap<String, i32>,
+    pub ifunc_sigs: HashMap<i32, SigVec>,
+}
+
+/// Build the jump table of a wasm patch. Returns the table and, on the fast path, the slots
+/// of the patch for the next jump table.
 pub fn create_wasm_jump_table(
     patch: &Path,
     cache: &HotpatchModuleCache,
     keep_names: bool,
     dwarf_sidecar: bool,
-) -> Result<JumpTable> {
+    previous: Option<&PatchIfuncs>,
+) -> Result<(JumpTable, Option<PatchIfuncs>)> {
     let t_start = std::time::Instant::now();
     let linked = std::fs::read(patch).context("Could not read patch file")?;
 
@@ -568,11 +583,14 @@ pub fn create_wasm_jump_table(
     // function body, so if any are present we have to take the walrus path that re-encodes the code.
     if analysis.needs_body_rewrite {
         tracing::debug!("Patch needs wbg_cast body rewrite; using walrus jump-table path");
-        return create_wasm_jump_table_walrus(patch, cache, keep_names, sidecar);
+        return Ok((
+            create_wasm_jump_table_walrus(patch, cache, keep_names, sidecar)?,
+            None,
+        ));
     }
 
     create_wasm_jump_table_fast(
-        patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names, sidecar,
+        patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names, sidecar, previous,
     )
 }
 
@@ -810,8 +828,9 @@ fn create_wasm_jump_table_fast(
     t_parsed: std::time::Duration,
     keep_names: bool,
     dwarf_sidecar: Option<PathBuf>,
-) -> Result<JumpTable> {
-    use subsecond_types::WasmFixups;
+    previous: Option<&PatchIfuncs>,
+) -> Result<(JumpTable, Option<PatchIfuncs>)> {
+    use subsecond_types::{PreviousPatch, WasmFixups};
 
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
     // Base-derived signatures, precomputed at cache-build time (normalized for cross-parser
@@ -890,6 +909,26 @@ fn create_wasm_jump_table_fast(
             }
         }
     }
+
+    // The same pairs from the region of the previous patch, so that the runtime repoints the
+    // slots that the vtables and the function pointers of the previous patch use. The previous
+    // module then holds no slot of the table, and the browser can free it.
+    let previous_patch = previous.map(|prev| {
+        let mut repoint = Vec::new();
+        for (name, &prev_idx) in prev.name_to_ifunc.iter() {
+            let Some(&new_idx) = analysis.name_to_ifunc.get(name.as_str()) else {
+                continue;
+            };
+            if prev.ifunc_sigs.get(&prev_idx) == analysis.ifunc_sigs.get(&new_idx) {
+                repoint.push((prev_idx as u64, new_idx as u64));
+            }
+        }
+        repoint.sort_unstable();
+        PreviousPatch {
+            lib: prev.lib.clone(),
+            repoint,
+        }
+    });
     let t_analyzed = t_start.elapsed();
 
     // Find the function index (in the *served* module's index space, which we don't change) of the
@@ -916,13 +955,14 @@ fn create_wasm_jump_table_fast(
     let t_emitted = t_start.elapsed();
 
     tracing::info!(
-        "Jump table (fast): parse={}ms analyze={}ms emit={}ms total={}ms | map={} repoint={} ifunc_count={ifunc_count} GOT.func={n_got_func} GOT.mem={n_got_mem} env_ifunc={n_env_ifunc} (sig-skipped {env_skipped_sig})",
+        "Jump table (fast): parse={}ms analyze={}ms emit={}ms total={}ms | map={} repoint={} previous={} ifunc_count={ifunc_count} GOT.func={n_got_func} GOT.mem={n_got_mem} env_ifunc={n_env_ifunc} (sig-skipped {env_skipped_sig})",
         t_parsed.as_millis(),
         t_analyzed.saturating_sub(t_parsed).as_millis(),
         t_emitted.saturating_sub(t_analyzed).as_millis(),
         t_emitted.as_millis(),
         map.len(),
         ifunc_repoint.len(),
+        previous_patch.as_ref().map_or(0, |p| p.repoint.len()),
     );
 
     if map.is_empty() {
@@ -933,7 +973,12 @@ fn create_wasm_jump_table_fast(
         );
     }
 
-    Ok(JumpTable {
+    let ifuncs = PatchIfuncs {
+        lib: lib.clone(),
+        name_to_ifunc: analysis.name_to_ifunc,
+        ifunc_sigs: analysis.ifunc_sigs,
+    };
+    let table = JumpTable {
         map,
         lib,
         ifunc_count,
@@ -941,6 +986,7 @@ fn create_wasm_jump_table_fast(
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
+        previous_patch,
         wasm: Some(WasmFixups {
             got_func,
             got_mem,
@@ -948,7 +994,8 @@ fn create_wasm_jump_table_fast(
             got_mutable,
         }),
         base_id: cache.base_id,
-    })
+    };
+    Ok((table, Some(ifuncs)))
 }
 
 /// Resolve a `GOT.mem` import's value: the absolute offset of the named data symbol in the base
@@ -1394,6 +1441,7 @@ fn create_wasm_jump_table_walrus(
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
+        previous_patch: None,
         wasm: None,
         base_id: cache.base_id,
     })

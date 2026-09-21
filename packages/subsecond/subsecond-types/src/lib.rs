@@ -5,6 +5,16 @@ use std::{
     path::PathBuf,
 };
 
+/// See `JumpTable::previous_patch`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct PreviousPatch {
+    /// The `lib` of the previous jump table. A tab that did not apply that patch, because the
+    /// page loaded after it, skips the repoint.
+    pub lib: PathBuf,
+    /// `(slot in the region of the previous patch, new ifunc index)`.
+    pub repoint: Vec<(u64, u64)>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct JumpTable {
     /// The dylib containing the patch. This should be a valid path so you can just pass it to LibLoading
@@ -64,6 +74,15 @@ pub struct JumpTable {
     /// sites. New indices are pre-rebase (the runtime adds `__table_base`).
     #[serde(default)]
     pub ifunc_repoint: Vec<(u64, u64)>,
+
+    /// (wasm only) The patch before this one in the session, with the pairs `(slot in the
+    /// region of that patch, new ifunc index)` whose functions have the same signature. The
+    /// vtables and the function pointers in the data of the previous patch point into its
+    /// region. The runtime repoints that region, and every older slot that holds a function
+    /// of the previous patch, so that no slot keeps the previous module alive. New indices
+    /// are pre-rebase, like `ifunc_repoint`. `None` on the first patch after a fat build.
+    #[serde(default)]
+    pub previous_patch: Option<PreviousPatch>,
 
     /// (wasm only) Values the runtime must supply for the patch's dynamic-linking imports at
     /// instantiate time. When present, the CLI served the patch *without* rewriting it (no walrus

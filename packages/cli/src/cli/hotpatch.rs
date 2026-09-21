@@ -101,7 +101,7 @@ impl HotpatchTip {
         let patch_exe = request.patch_exe(artifacts.time_start);
 
         Ok(StructuredOutput::Hotpatch {
-            jump_table: request.create_jump_table(&patch_exe, &cache)?,
+            jump_table: request.create_jump_table(&patch_exe, &cache, None)?.0,
             artifacts: artifacts.into_structured_output(),
         })
     }
