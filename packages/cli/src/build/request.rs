@@ -2411,6 +2411,31 @@ impl BuildRequest {
         Ok(())
     }
 
+    /// Move the tip objects of the fat build into `hotpatch_base_tip_dir`, and clear the base
+    /// rlibs of the previous fat build.
+    pub(crate) fn keep_base_tip_objects(&self, objects: &[PathBuf]) -> Result<()> {
+        let base_dir = self.platform_dir().join("hotpatch-base");
+        if base_dir.exists() {
+            std::fs::remove_dir_all(&base_dir)?;
+        }
+        let dir = self.hotpatch_base_tip_dir();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        for object in objects {
+            let Some(file_name) = object.file_name() else {
+                continue;
+            };
+            if object.exists() {
+                std::fs::rename(object, dir.join(file_name)).with_context(|| {
+                    format!("Could not keep the base tip object '{}'", object.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recursively copy a directory and its contents.
     #[allow(clippy::only_used_in_recursion)]
     pub(crate) fn copy_build_dir_recursive(&self, src: &Path, dst: &Path) -> Result<()> {
@@ -2665,6 +2690,17 @@ impl BuildRequest {
     /// The directory that holds the tip objects of the last patch, for the next patch to link.
     pub(crate) fn hotpatch_tip_dir(&self) -> PathBuf {
         self.platform_dir().join("hotpatch-tip")
+    }
+
+    /// The directory that holds the rlib of the fat build of a workspace crate that a patch
+    /// replayed in place. See `changed_functions_since_base`.
+    pub(crate) fn hotpatch_base_dir(&self, crate_name: &str) -> PathBuf {
+        self.platform_dir().join("hotpatch-base").join(crate_name)
+    }
+
+    /// The directory that holds the tip objects of the fat build.
+    pub(crate) fn hotpatch_base_tip_dir(&self) -> PathBuf {
+        self.platform_dir().join("hotpatch-base-tip")
     }
 
     /// The directory of one verify pass. See `verify_skipped_dependents`.

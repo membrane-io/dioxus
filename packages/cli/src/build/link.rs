@@ -15,7 +15,7 @@
 //! source of truth is the read-out of the link args after the initial build
 
 use super::HotpatchModuleCache;
-use crate::build::patch::PatchIfuncs;
+use crate::build::patch::{ObjectIndex, PatchIfuncs};
 use crate::{BuildArtifacts, BuildMode, TipObjects, WorkspaceRustcArgs};
 use crate::{BuildContext, Error, LinkerFlavor, Result, RustcArgs, Workspace};
 use crate::{BuildRequest, DX_RUSTC_WRAPPER_ENV_VAR};
@@ -478,6 +478,7 @@ impl BuildRequest {
             aslr_reference,
             workspace_rustc_args,
             cache,
+            modified_crates,
             ..
         } = &ctx.mode
         else {
@@ -570,6 +571,88 @@ impl BuildRequest {
         let mut object_files: Vec<PathBuf> = temp_objects.clone();
         object_files.extend(workspace_rlibs.iter().cloned());
 
+        // A wasm patch links only the objects that define the functions it must hold, see
+        // `HotpatchModuleCache::patch_functions`. The linker keeps a function only when a
+        // root reaches it, and it loads a member of an rlib only when a loaded object
+        // references a symbol of that member. A whole rlib in the link, or `main` as a root,
+        // pulls the closure of every referenced member: fifty megabytes of code for a change
+        // in one low crate. So the link input is the tip objects and the rlib members that
+        // define the needed functions, and nothing else. Every other reference becomes an
+        // import that the jump table resolves to a slot of the base table or to an export of
+        // the base. The roots are the needed functions that have a slot in the base table,
+        // through `--export-if-defined`, in a response file because a name can hold a space
+        // or an arrow. `finalize_patch_wasm` removes the exports again.
+        let mut roots: Vec<String> = Vec::new();
+        let patch_objects_dir = self.patch_exe(tip.time_start).with_extension("objects");
+        if self.linker_flavor() == LinkerFlavor::WasmLld {
+            let t_select = std::time::Instant::now();
+            let index = crate::build::patch::function_hashes(&object_files)?;
+            let seeds = self.changed_functions_since_base(
+                workspace_rustc_args,
+                modified_crates,
+                out_of_place_crates,
+                &object_files,
+                temp_objects.len(),
+                &index,
+            )?;
+            let functions = cache.patch_functions(seeds.iter().map(String::as_str));
+            // A changed function that the base does not hold, a new function, is not in
+            // `needed`. The patch holds it too, for a caller that the patch holds.
+            // An earlier patch since the fat build repointed the slots of the functions it
+            // defined. The patch defines them again, so those slots repoint to the newest
+            // code, also when this edit took the code back to the base. An empty set here
+            // means the edit changed no code, and the app keeps the last patch.
+            let earlier: Vec<String> = cache
+                .patched_functions
+                .read()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect();
+            let earlier_functions = cache.patch_functions(earlier.iter().map(String::as_str));
+            let mut wanted: HashSet<&str> = functions.needed.clone();
+            wanted.extend(seeds.iter().map(String::as_str));
+            wanted.extend(earlier_functions.needed.iter().copied());
+            wanted.extend(earlier.iter().map(String::as_str));
+            if wanted.is_empty() {
+                bail!("No function changed since the fat build, so there is nothing to patch");
+            }
+            cache
+                .patched_functions
+                .write()
+                .unwrap()
+                .extend(wanted.iter().map(|name| name.to_string()));
+            let (objects, missing) = index.objects_for(wanted.iter().copied());
+            if !missing.is_empty() {
+                tracing::debug!(
+                    "{} needed functions are in no object of the link, they become imports: {:?}",
+                    missing.len(),
+                    &missing[..missing.len().min(20)]
+                );
+            }
+            _ = std::fs::remove_dir_all(&patch_objects_dir);
+            std::fs::create_dir_all(&patch_objects_dir)
+                .context("Could not create the patch object dir")?;
+            object_files = index.write_objects(&object_files, &objects, &patch_objects_dir)?;
+            roots = functions
+                .roots
+                .iter()
+                .chain(&earlier_functions.roots)
+                .map(|name| name.to_string())
+                .collect();
+            roots.sort_unstable();
+            roots.dedup();
+            tracing::debug!(
+                "Patch link input: {} changed functions, {} needed, {} roots, {} of {} objects, in {:?}",
+                seeds.len(),
+                wanted.len(),
+                roots.len(),
+                object_files.len(),
+                index.objects.len(),
+                t_select.elapsed()
+            );
+        }
+
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
         //
@@ -623,27 +706,15 @@ impl BuildRequest {
         out_args.extend(dylibs.iter().map(Into::into));
         out_args.extend(self.thin_link_args(link_args)?.iter().map(Into::into));
 
-        // The linker keeps a function of the patch only when a root reaches it, and it loads a
-        // member of an rlib only when a loaded object references a symbol of that member. The
-        // tip does not reference every function of a changed crate: a dependent that the
-        // interface gate skipped can be the only caller. The base module calls such a function
-        // through a slot of the shared table, and the jump table repoints that slot only when
-        // the patch holds the function. So every function of the base table is a root, through
-        // `--export-if-defined`, in a response file because the list is long. A function that
-        // the base module does not hold stays out, unless patch code reaches it. That matters:
-        // such a function can refer, through `GOT.func`, to a function that the base module
-        // dropped, and the jump table has no slot for that. `finalize_patch_wasm` removes the
-        // exports again.
         let roots_file = out_exe.with_extension("roots.rsp");
         if self.linker_flavor() == LinkerFlavor::WasmLld {
-            // A name can hold a space or an arrow, so each one is quoted for the linker.
-            let mut roots = String::new();
-            for name in cache.symbol_ifunc_map.keys().sorted() {
-                roots.push_str("\"--export-if-defined=");
-                roots.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
-                roots.push_str("\"\n");
+            let mut contents = String::new();
+            for name in roots.iter().sorted() {
+                contents.push_str("\"--export-if-defined=");
+                contents.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
+                contents.push_str("\"\n");
             }
-            std::fs::write(&roots_file, roots).context("Could not write the linker roots")?;
+            std::fs::write(&roots_file, contents).context("Could not write the linker roots")?;
             out_args.push(format!("@{}", roots_file.display()).into());
         }
         out_args.extend(out_arg.iter().map(Into::into));
@@ -678,6 +749,7 @@ impl BuildRequest {
             .output()
             .await?;
         _ = std::fs::remove_file(&roots_file);
+        _ = std::fs::remove_dir_all(&patch_objects_dir);
 
         if !res.stderr.is_empty() {
             let errs = String::from_utf8_lossy(&res.stderr);
@@ -869,8 +941,6 @@ impl BuildRequest {
                     "--import-memory".to_string(),
                     "--import-table".to_string(),
                     "--growable-table".to_string(),
-                    "--export".to_string(),
-                    "main".to_string(),
                     "--allow-undefined".to_string(),
                     "--no-demangle".to_string(),
                     "--no-entry".to_string(),
@@ -884,8 +954,9 @@ impl BuildRequest {
                 // five times the functions that `main` reaches. The runtime calls three
                 // exports of a patch only, the relocation and constructor thunks, and the
                 // jump table reads the element table and the `name` section. So the thin
-                // link drops those pairs. The roots of the link are the functions of the base
-                // table instead, see the response file in `compile_workspace_hotpatch_attempt`.
+                // link drops those pairs, and `main` too. The roots of the link are the needed
+                // functions of the base table instead, see the response file in
+                // `compile_workspace_hotpatch_attempt`.
             }
 
             // This uses "cc" and these args need to be ld compatible
@@ -1017,6 +1088,23 @@ impl BuildRequest {
     ///
     /// This produces updated outputs at the same paths cargo originally wrote to.
     /// Used during thin builds to replay the modified workspace chain before the tip crate.
+    /// Copy the rlib of `crate_name` into `hotpatch_base_dir` when that directory holds no rlib
+    /// yet. See `changed_functions_since_base`.
+    fn keep_base_rlib(&self, crate_name: &str, rustc_args: &RustcArgs) -> Result<()> {
+        let Ok(rlib) = self.find_rlib_for_crate(crate_name, rustc_args, None) else {
+            return Ok(());
+        };
+        let dir = self.hotpatch_base_dir(crate_name);
+        let target = dir.join(rlib.file_name().context("The rlib has no file name")?);
+        if target.exists() || !rlib.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&dir)?;
+        std::fs::copy(&rlib, &target)
+            .with_context(|| format!("Could not keep the base rlib '{}'", rlib.display()))?;
+        Ok(())
+    }
+
     async fn compile_dep_crate(
         &self,
         ctx: &BuildContext,
@@ -1029,13 +1117,19 @@ impl BuildRequest {
         cmd.env_clear();
 
         let out_dir = overrides.out_dir.as_deref();
-        if let Some(out_dir) = out_dir {
-            std::fs::create_dir_all(out_dir).with_context(|| {
-                format!(
-                    "Failed to create the replay directory '{}'",
-                    out_dir.display()
-                )
-            })?;
+        match out_dir {
+            Some(out_dir) => {
+                std::fs::create_dir_all(out_dir).with_context(|| {
+                    format!(
+                        "Failed to create the replay directory '{}'",
+                        out_dir.display()
+                    )
+                })?;
+            }
+            // An in-place replay overwrites the rlib of the fat build. The next patch compares
+            // its functions against that rlib, so the first replay after a fat build keeps a
+            // copy of it in `hotpatch_base_dir`.
+            None => self.keep_base_rlib(crate_name, rustc_args)?,
         }
 
         // Skip args[0] which is the rustc binary path captured by the wrapper.
@@ -1423,6 +1517,99 @@ impl BuildRequest {
         ordered.extend(remaining);
 
         Ok(ordered)
+    }
+
+    /// The functions of the changed crates and of the tip whose code differs from the base
+    /// module. The base copy of every other function stays valid.
+    ///
+    /// `index` holds the hash of every function of `object_files`, the link inputs, whose
+    /// first `tip_count` entries are the tip objects. The comparison runs against the objects
+    /// of the fat build: the rlib in the cargo target directory for a crate that replayed out
+    /// of place, the copy in `hotpatch_base_dir` for a crate that replayed in place, and the
+    /// tip objects in `hotpatch_base_tip_dir`. Without a base copy, every function of the
+    /// crate counts as changed.
+    fn changed_functions_since_base(
+        &self,
+        args: &WorkspaceRustcArgs,
+        modified_crates: &HashSet<String>,
+        out_of_place_crates: &HashSet<String>,
+        object_files: &[PathBuf],
+        tip_count: usize,
+        index: &ObjectIndex,
+    ) -> Result<Vec<String>> {
+        fn changed(old: &ObjectIndex, new: &ObjectIndex, sources: &HashSet<usize>) -> Vec<String> {
+            new.functions
+                .iter()
+                .filter(|(_, function)| sources.contains(&new.objects[function.object].source))
+                .filter(|(name, function)| {
+                    old.functions
+                        .get(*name)
+                        .is_none_or(|o| o.hash != function.hash)
+                })
+                .map(|(name, _)| name.clone())
+                .sorted()
+                .collect()
+        }
+
+        let tip = self.tip_package_name();
+        let mut changed_crates: HashSet<String> = modified_crates.clone();
+        changed_crates.extend(out_of_place_crates.iter().cloned());
+        let mut seeds = Vec::new();
+        for crate_name in changed_crates.iter().sorted() {
+            if *crate_name == tip {
+                continue;
+            }
+            let Some(rustc_args) = args.rustc_args.get(&format!("{crate_name}.lib")) else {
+                continue;
+            };
+            let out_of_place = out_of_place_crates.contains(crate_name);
+            let new = self.find_rlib_for_crate(
+                crate_name,
+                rustc_args,
+                out_of_place.then(|| self.hotpatch_replay_dir(crate_name)),
+            )?;
+            let Some(source) = object_files.iter().position(|path| *path == new) else {
+                tracing::warn!(
+                    "The rlib of the changed crate {crate_name} is not a link input: {}",
+                    new.display()
+                );
+                continue;
+            };
+            let old = if out_of_place {
+                Some(self.find_rlib_for_crate(crate_name, rustc_args, None)?)
+            } else {
+                self.find_rlib_for_crate(
+                    crate_name,
+                    rustc_args,
+                    Some(self.hotpatch_base_dir(crate_name)),
+                )
+                .ok()
+            };
+            let old: Vec<PathBuf> = old.into_iter().filter(|path| path.exists()).collect();
+            let old = crate::build::patch::function_hashes(&old)?;
+            let changed = changed(&old, index, &HashSet::from([source]));
+            tracing::debug!(
+                "{} functions of {crate_name} differ from the base",
+                changed.len()
+            );
+            seeds.extend(changed);
+        }
+
+        let base_tip: Vec<PathBuf> = std::fs::read_dir(self.hotpatch_base_tip_dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "o"))
+            .collect();
+        let old = crate::build::patch::function_hashes(&base_tip)?;
+        let changed = changed(&old, index, &(0..tip_count).collect());
+        tracing::debug!(
+            "{} functions of the tip differ from the base",
+            changed.len()
+        );
+        seeds.extend(changed);
+        Ok(seeds)
     }
 
     /// Patches are stored in the same directory as the main executable, but with a name based on the
@@ -1864,9 +2051,21 @@ impl BuildRequest {
             tracing::trace!("Output from fat linking: {}", out.trim());
         }
 
-        // Clean up the temps manually
-        for f in args.iter().filter(|arg| arg.ends_with(".rcgu.o")) {
-            _ = std::fs::remove_file(f);
+        // Every patch compares its objects against the objects of this fat build, see
+        // `changed_functions_since_base`. The tip objects move into `hotpatch_base_tip_dir`
+        // on wasm, and the base rlibs of the previous fat build go away. On the other
+        // platforms the temps go away.
+        let objects: Vec<PathBuf> = args
+            .iter()
+            .filter(|arg| arg.ends_with(".rcgu.o"))
+            .map(PathBuf::from)
+            .collect();
+        if self.is_wasm_or_wasi() {
+            self.keep_base_tip_objects(&objects)?;
+        } else {
+            for object in &objects {
+                _ = std::fs::remove_file(object);
+            }
         }
 
         // Cache the rlibs list

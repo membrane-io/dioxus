@@ -85,6 +85,29 @@ pub struct HotpatchModuleCache {
     /// gate `env` imports and in-place repoints without re-deriving base signatures every patch.
     pub ifunc_sigs: HashMap<i32, SigVec>,
 
+    /// (wasm) The direct callers of each function of the base, by wasm function index:
+    /// `callers[callee]` holds the index of every function with a `call callee` instruction.
+    /// The functions of a patch link come from this graph, see `patch_functions`.
+    pub callers: Vec<Vec<u32>>,
+
+    /// (wasm) The direct callees of each function of the base, by wasm function index.
+    pub callees: Vec<Vec<u32>>,
+
+    /// (wasm) Function symbol name → wasm function index, from the linking section of the base.
+    pub symbol_func_index: HashMap<String, u32>,
+
+    /// (wasm) The name of each function of the base, by wasm function index, from the `name`
+    /// section. An import without a name has an empty string.
+    pub func_names: Vec<String>,
+
+    /// (wasm) Whether each function of the base, by wasm function index, has a slot in the table.
+    pub in_table: Vec<bool>,
+
+    /// (wasm) The functions that the patches since the fat build defined. The next patch
+    /// defines them again, so that the slots of an earlier patch repoint to the newest code,
+    /// also when an edit took the code back to the base.
+    pub patched_functions: RwLock<HashSet<String>>,
+
     /// (wasm) Per-build identity read from the base's exported `__subsecond_base_id` global, copied
     /// into every `JumpTable` so the runtime can reject patches built against a different base.
     /// `None` if the base doesn't carry the global (older base, or wasm-bindgen dropped it).
@@ -217,7 +240,9 @@ impl HotpatchModuleCache {
             _ if triple.architecture == Architecture::Wasm32 => {
                 let bytes = std::fs::read(original)?;
                 let ParsedModule {
-                    module, symbols, ..
+                    module,
+                    symbols,
+                    ids,
                 } = parse_module_with_ids(&bytes)?;
 
                 if symbols.symbols.is_empty() {
@@ -263,6 +288,43 @@ impl HotpatchModuleCache {
                     symbol_ifunc_map
                         .entry((*name).to_string())
                         .or_insert(*offset);
+                }
+
+                // The linking section counts functions in the index space of the module before
+                // wasm-bindgen, so its indices do not name the functions of this module. The
+                // `name` section does. A symbol that merged into another function maps through
+                // `func_to_index` to the name that the `name` section holds.
+                let (callers, callees) = collect_direct_calls(&module, &ids);
+                let name_to_wasm_index: HashMap<&str, u32> = ids
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, id)| {
+                        Some((module.funcs.get(*id).name.as_deref()?, index as u32))
+                    })
+                    .collect();
+                let mut symbol_func_index: HashMap<String, u32> = symbols
+                    .code_symbol_map
+                    .iter()
+                    .filter_map(|(name, link_index)| {
+                        let unified = func_to_index.get(link_index)?;
+                        let index = name_to_wasm_index.get(unified)?;
+                        Some((name.to_string(), *index))
+                    })
+                    .collect();
+                for (name, index) in &name_to_wasm_index {
+                    symbol_func_index
+                        .entry((*name).to_string())
+                        .or_insert(*index);
+                }
+                let func_names: Vec<String> = ids
+                    .iter()
+                    .map(|id| module.funcs.get(*id).name.clone().unwrap_or_default())
+                    .collect();
+                let mut in_table = vec![false; ids.len()];
+                for (name, index) in &symbol_func_index {
+                    if symbol_ifunc_map.contains_key(name) {
+                        in_table[*index as usize] = true;
+                    }
                 }
 
                 let old_exports = module
@@ -312,6 +374,11 @@ impl HotpatchModuleCache {
                     base_id,
                     data_symbol_offsets,
                     ifunc_sigs,
+                    callers,
+                    callees,
+                    symbol_func_index,
+                    func_names,
+                    in_table,
                     ..Default::default()
                 }
             }
@@ -1511,6 +1578,438 @@ fn count_ifunc_slots(m: &Module) -> u64 {
         slots = slots.max(offset.max(0) as u64 + len);
     }
     slots
+}
+
+/// The functions that a patch must define. See `HotpatchModuleCache::patch_functions`.
+pub struct PatchFunctions<'a> {
+    /// The functions of `needed` that have a slot in the base table. They are the roots of the
+    /// patch link.
+    pub roots: Vec<&'a str>,
+    /// Every function that the patch must define: the changed functions, every function that
+    /// reaches one of them through direct calls, and every callee of those that the patch
+    /// cannot import from the base.
+    pub needed: HashSet<&'a str>,
+}
+
+impl HotpatchModuleCache {
+    /// The functions that a patch must define, from the names of the functions whose code
+    /// changed.
+    ///
+    /// The base module calls a changed function either through a table slot, which the jump
+    /// table repoints, or through a direct call from another function. The patch must hold a
+    /// new copy of every function on such a direct call chain, up to the table slot that starts
+    /// the chain. Those table functions are the roots of the patch link. Every other call from
+    /// patch code goes to the base through an import, which the jump table resolves from the
+    /// table or from the exports of the base. A callee that is in neither must also be in the
+    /// patch, with its own callees in turn.
+    pub fn patch_functions<'a>(
+        &'a self,
+        seeds: impl IntoIterator<Item = &'a str>,
+    ) -> PatchFunctions<'a> {
+        let mut reached = vec![false; self.callers.len()];
+        let mut to_visit: Vec<u32> = seeds
+            .into_iter()
+            .filter_map(|name| self.symbol_func_index.get(name).copied())
+            .collect();
+        let mut order = Vec::new();
+        while let Some(index) = to_visit.pop() {
+            let slot = &mut reached[index as usize];
+            if *slot {
+                continue;
+            }
+            *slot = true;
+            order.push(index);
+            to_visit.extend(self.callers[index as usize].iter().copied());
+        }
+        let mut to_visit = order;
+        while let Some(index) = to_visit.pop() {
+            for callee in &self.callees[index as usize] {
+                let callee = *callee as usize;
+                if reached[callee]
+                    || self.in_table[callee]
+                    || self.old_exports.contains(&self.func_names[callee])
+                {
+                    continue;
+                }
+                reached[callee] = true;
+                to_visit.push(callee as u32);
+            }
+        }
+        let needed: HashSet<&str> = self
+            .symbol_func_index
+            .iter()
+            .filter(|(_, index)| reached[**index as usize])
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let roots = needed
+            .iter()
+            .copied()
+            .filter(|name| self.symbol_ifunc_map.contains_key(*name))
+            .collect();
+        PatchFunctions { roots, needed }
+    }
+}
+
+/// The direct callers and the direct callees of every function of `module`, by wasm function
+/// index. `ids` maps a wasm function index to its walrus id.
+fn collect_direct_calls(module: &Module, ids: &[FunctionId]) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
+    struct Calls {
+        callees: Vec<FunctionId>,
+    }
+    impl<'a> walrus::ir::Visitor<'a> for Calls {
+        fn visit_instr(&mut self, instr: &'a walrus::ir::Instr, _loc: &'a walrus::ir::InstrLocId) {
+            if let walrus::ir::Instr::Call(call) = instr {
+                self.callees.push(call.func);
+            }
+        }
+    }
+
+    let id_to_index: HashMap<FunctionId, u32> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, index as u32))
+        .collect();
+    let edges: Vec<(u32, u32)> = module
+        .funcs
+        .par_iter_local()
+        .flat_map_iter(|(id, local)| {
+            let mut calls = Calls {
+                callees: Vec::new(),
+            };
+            walrus::ir::dfs_in_order(&mut calls, local, local.entry_block());
+            calls.callees.sort_unstable();
+            calls.callees.dedup();
+            let caller = id_to_index[&id];
+            let id_to_index = &id_to_index;
+            calls
+                .callees
+                .into_iter()
+                .map(move |callee| (caller, id_to_index[&callee]))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut callers = vec![Vec::new(); ids.len()];
+    let mut callees = vec![Vec::new(); ids.len()];
+    for (caller, callee) in edges {
+        callers[callee as usize].push(caller);
+        callees[caller as usize].push(callee);
+    }
+    (callers, callees)
+}
+
+/// A function of an rlib or of an object. See `function_hashes`.
+#[derive(Clone, Debug)]
+pub struct FunctionOrigin {
+    /// The canonical hash of the code of the function.
+    pub hash: u64,
+    /// The index of the object that defines the function, in `ObjectIndex::objects`.
+    pub object: usize,
+}
+
+/// One wasm object of a link input: an object file, or one member of an rlib.
+#[derive(Clone, Debug)]
+pub struct PatchObject {
+    /// The index of the path in the `paths` of the call.
+    pub source: usize,
+    /// The byte range of the archive member, or `None` for an object file.
+    pub member: Option<Range<usize>>,
+    /// The hidden functions that the object does not define but takes the address of, in its
+    /// code or in its data. wasm-ld fails on a table entry for an undefined hidden function,
+    /// so the object that defines each one must be in the same link.
+    pub hidden_address_refs: Vec<String>,
+}
+
+/// The functions and the objects of a set of link inputs. See `function_hashes`.
+#[derive(Default, Debug)]
+pub struct ObjectIndex {
+    pub functions: HashMap<String, FunctionOrigin>,
+    pub objects: Vec<PatchObject>,
+}
+
+/// The canonical hash of every function that the wasm objects in `paths` define, by symbol
+/// name. A path is an rlib archive or a single object file.
+///
+/// The hash covers the code of the function with every relocation site set to zero, and the
+/// relocations of that code as (offset, type, target name, addend), so that two compiles of the
+/// same source give the same hash when the object around the function changed.
+pub fn function_hashes(paths: &[PathBuf]) -> anyhow::Result<ObjectIndex> {
+    let mut index = ObjectIndex::default();
+    for (source, path) in paths.iter().enumerate() {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+        match object::read::archive::ArchiveFile::parse(&*bytes) {
+            Ok(archive) => {
+                for member in archive.members() {
+                    let member = member?;
+                    let (offset, size) = member.file_range();
+                    let range = offset as usize..(offset + size) as usize;
+                    let data = member.data(&*bytes)?;
+                    if data.starts_with(b"\0asm") {
+                        hash_object_functions(data, source, Some(range), &mut index)
+                            .with_context(|| format!("In a member of {}", path.display()))?;
+                    }
+                }
+            }
+            Err(_) => hash_object_functions(&bytes, source, None, &mut index)
+                .with_context(|| format!("In {}", path.display()))?,
+        }
+    }
+    Ok(index)
+}
+
+impl ObjectIndex {
+    /// The objects that a link of the functions in `wanted` needs: the object that defines
+    /// each one, and the objects that define the hidden functions those objects take the
+    /// address of, in turn. Returns the object indices, and the names of the wanted or
+    /// address-taken functions that no object defines.
+    pub fn objects_for<'a>(
+        &self,
+        wanted: impl IntoIterator<Item = &'a str>,
+    ) -> (Vec<usize>, Vec<String>) {
+        let mut selected = vec![false; self.objects.len()];
+        let mut missing = Vec::new();
+        let mut to_visit = Vec::new();
+        for name in wanted {
+            match self.functions.get(name) {
+                Some(function) => to_visit.push(function.object),
+                None => missing.push(name.to_string()),
+            }
+        }
+        while let Some(object) = to_visit.pop() {
+            if selected[object] {
+                continue;
+            }
+            selected[object] = true;
+            for name in &self.objects[object].hidden_address_refs {
+                match self.functions.get(name) {
+                    Some(function) => to_visit.push(function.object),
+                    None => missing.push(name.clone()),
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let objects = (0..self.objects.len())
+            .filter(|object| selected[*object])
+            .collect();
+        (objects, missing)
+    }
+
+    /// Write the objects with the indices in `objects` into `dir`, one file per archive member,
+    /// and return their paths in link order. An object file keeps its own path.
+    pub fn write_objects(
+        &self,
+        paths: &[PathBuf],
+        objects: &[usize],
+        dir: &Path,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let mut archive: Option<(usize, Vec<u8>)> = None;
+        for object in objects {
+            let PatchObject { source, member, .. } = &self.objects[*object];
+            let Some(range) = member else {
+                out.push(paths[*source].clone());
+                continue;
+            };
+            if archive.as_ref().is_none_or(|(loaded, _)| loaded != source) {
+                archive = Some((*source, std::fs::read(&paths[*source])?));
+            }
+            let bytes = &archive.as_ref().unwrap().1;
+            let stem = paths[*source]
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("member");
+            let path = dir.join(format!("{stem}.{}.o", range.start));
+            std::fs::write(&path, &bytes[range.clone()])?;
+            out.push(path);
+        }
+        Ok(out)
+    }
+}
+
+/// Hash every defined function of one wasm object into `index`, and record the object. See
+/// `function_hashes`.
+fn hash_object_functions(
+    bytes: &[u8],
+    source: usize,
+    member: Option<Range<usize>>,
+    index: &mut ObjectIndex,
+) -> anyhow::Result<()> {
+    use std::hash::{Hash, Hasher};
+    use wasmparser::{KnownCustom, TypeRef};
+
+    let mut import_funcs: Vec<String> = Vec::new();
+    let mut import_globals: Vec<String> = Vec::new();
+    let mut import_tables: Vec<String> = Vec::new();
+    let mut import_tags: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
+    let mut code_start = 0usize;
+    let mut bodies: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut symbols: Vec<SymbolInfo> = Vec::new();
+    let mut relocs: Vec<wasmparser::RelocationEntry> = Vec::new();
+    let mut data_relocs: Vec<wasmparser::RelocationEntry> = Vec::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::TypeSection(section) => {
+                for group in section {
+                    for sub in group?.into_types() {
+                        types.push(format!("{:?}", sub.composite_type));
+                    }
+                }
+            }
+            Payload::ImportSection(section) => {
+                for import in section {
+                    let import = import?;
+                    // The symbol of an undefined function has the name of the import, without
+                    // the module, so it matches the symbol of the object that defines it.
+                    let name = import.name.to_string();
+                    match import.ty {
+                        TypeRef::Func(_) => import_funcs.push(name),
+                        TypeRef::Global(_) => import_globals.push(name),
+                        TypeRef::Table(_) => import_tables.push(name),
+                        TypeRef::Tag(_) => import_tags.push(name),
+                        _ => {}
+                    }
+                }
+            }
+            Payload::CodeSectionStart { range, .. } => code_start = range.start,
+            Payload::CodeSectionEntry(body) => bodies.push(body.range()),
+            Payload::CustomSection(section) => match section.as_known() {
+                KnownCustom::Linking(reader) => {
+                    for subsection in reader.subsections() {
+                        if let Linking::SymbolTable(map) = subsection? {
+                            symbols = map.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        }
+                    }
+                }
+                KnownCustom::Reloc(reader) if section.name() == "reloc.CODE" => {
+                    relocs = reader
+                        .entries()
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+                KnownCustom::Reloc(reader) if section.name() == "reloc.DATA" => {
+                    data_relocs = reader
+                        .entries()
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    // The name of the target of a relocation, by symbol index. An undefined function, global,
+    // table or tag takes the name of its import.
+    let import_name = |imports: &[String], index: u32, name: Option<&str>| -> String {
+        match name {
+            Some(name) => name.to_string(),
+            None => imports
+                .get(index as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("#{index}")),
+        }
+    };
+    let symbol_names: Vec<String> = symbols
+        .iter()
+        .map(|symbol| match symbol {
+            SymbolInfo::Func { index, name, .. } => import_name(&import_funcs, *index, *name),
+            SymbolInfo::Data { name, .. } => name.to_string(),
+            SymbolInfo::Global { index, name, .. } => import_name(&import_globals, *index, *name),
+            SymbolInfo::Table { index, name, .. } => import_name(&import_tables, *index, *name),
+            SymbolInfo::Event { index, name, .. } => import_name(&import_tags, *index, *name),
+            SymbolInfo::Section { section, .. } => format!("section:{section}"),
+        })
+        .collect();
+    let mut defined_names: HashMap<u32, &str> = HashMap::new();
+    for symbol in &symbols {
+        if let SymbolInfo::Func {
+            index,
+            name: Some(name),
+            ..
+        } = symbol
+        {
+            if *index as usize >= import_funcs.len() {
+                defined_names.insert(*index, name);
+            }
+        }
+    }
+
+    // The hidden functions that the object takes the address of but does not define.
+    let mut hidden_address_refs: Vec<String> = relocs
+        .iter()
+        .chain(&data_relocs)
+        .filter(|reloc| {
+            use wasmparser::RelocationType::*;
+            matches!(
+                reloc.ty,
+                TableIndexSleb
+                    | TableIndexI32
+                    | TableIndexRelSleb
+                    | TableIndexSleb64
+                    | TableIndexI64
+                    | TableIndexRelSleb64
+            )
+        })
+        .filter_map(|reloc| match symbols.get(reloc.index as usize) {
+            Some(SymbolInfo::Func { flags, .. })
+                if flags.contains(wasmparser::SymbolFlags::UNDEFINED)
+                    && flags.contains(wasmparser::SymbolFlags::VISIBILITY_HIDDEN) =>
+            {
+                symbol_names.get(reloc.index as usize).cloned()
+            }
+            _ => None,
+        })
+        .collect();
+    hidden_address_refs.sort_unstable();
+    hidden_address_refs.dedup();
+    let object = index.objects.len();
+    index.objects.push(PatchObject {
+        source,
+        member,
+        hidden_address_refs,
+    });
+
+    relocs.sort_by_key(|reloc| reloc.offset);
+    let mut next_reloc = 0;
+    for (position, body) in bodies.iter().enumerate() {
+        let index_of_function = (import_funcs.len() + position) as u32;
+        let start = body.start - code_start;
+        let end = body.end - code_start;
+        let mut code = bytes[body.clone()].to_vec();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        while next_reloc < relocs.len() && (relocs[next_reloc].offset as usize) < end {
+            let reloc = relocs[next_reloc];
+            next_reloc += 1;
+            let site = reloc.relocation_range();
+            if site.start < start {
+                continue;
+            }
+            let local = (site.start - start)..(site.end - start).min(code.len());
+            code[local].fill(0);
+            (site.start - start).hash(&mut hasher);
+            (reloc.ty as u8).hash(&mut hasher);
+            if reloc.ty == wasmparser::RelocationType::TypeIndexLeb {
+                types.get(reloc.index as usize).hash(&mut hasher);
+            } else {
+                symbol_names.get(reloc.index as usize).hash(&mut hasher);
+            }
+            reloc.addend.hash(&mut hasher);
+        }
+        code.hash(&mut hasher);
+        if let Some(name) = defined_names.get(&index_of_function) {
+            index.functions.insert(
+                (*name).to_string(),
+                FunctionOrigin {
+                    hash: hasher.finish(),
+                    object,
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
