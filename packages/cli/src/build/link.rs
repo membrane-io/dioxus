@@ -614,6 +614,30 @@ impl BuildRequest {
         out_args.extend(object_files.iter().map(Into::into));
         out_args.extend(dylibs.iter().map(Into::into));
         out_args.extend(self.thin_link_args(link_args)?.iter().map(Into::into));
+
+        // The linker keeps a function of the patch only when a root reaches it, and it loads a
+        // member of an rlib only when a loaded object references a symbol of that member. The
+        // tip does not reference every function of a changed crate: a dependent that the
+        // interface gate skipped can be the only caller. The base module calls such a function
+        // through a slot of the shared table, and the jump table repoints that slot only when
+        // the patch holds the function. So every function of the base table is a root, through
+        // `--export-if-defined`, in a response file because the list is long. A function that
+        // the base module does not hold stays out, unless patch code reaches it. That matters:
+        // such a function can refer, through `GOT.func`, to a function that the base module
+        // dropped, and the jump table has no slot for that. `finalize_patch_wasm` removes the
+        // exports again.
+        let roots_file = out_exe.with_extension("roots.rsp");
+        if self.linker_flavor() == LinkerFlavor::WasmLld {
+            // A name can hold a space or an arrow, so each one is quoted for the linker.
+            let mut roots = String::new();
+            for name in cache.symbol_ifunc_map.keys().sorted() {
+                roots.push_str("\"--export-if-defined=");
+                roots.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
+                roots.push_str("\"\n");
+            }
+            std::fs::write(&roots_file, roots).context("Could not write the linker roots")?;
+            out_args.push(format!("@{}", roots_file.display()).into());
+        }
         out_args.extend(out_arg.iter().map(Into::into));
 
         if cfg!(windows) {
@@ -645,6 +669,7 @@ impl BuildRequest {
             .envs(command_envs)
             .output()
             .await?;
+        _ = std::fs::remove_file(&roots_file);
 
         if !res.stderr.is_empty() {
             let errs = String::from_utf8_lossy(&res.stderr);
@@ -845,13 +870,14 @@ impl BuildRequest {
                     "--experimental-pic".to_string(),
                 ]);
 
-                // retain exports so post-processing has hooks to work with
-                for (idx, arg) in original_args.iter().enumerate() {
-                    if *arg == "--export" {
-                        out_args.push(arg.to_string());
-                        out_args.push(original_args[idx + 1].to_string());
-                    }
-                }
+                // The captured args hold one `--export <symbol>` pair per exported symbol of
+                // the whole program, thousands for a large app. Each pair is a root for the
+                // linker, so the patch would keep every function that an export reaches,
+                // five times the functions that `main` reaches. The runtime calls three
+                // exports of a patch only, the relocation and constructor thunks, and the
+                // jump table reads the element table and the `name` section. So the thin
+                // link drops those pairs. The roots of the link are the functions of the base
+                // table instead, see the response file in `compile_workspace_hotpatch_attempt`.
             }
 
             // This uses "cc" and these args need to be ld compatible
@@ -1875,7 +1901,7 @@ impl BuildRequest {
         let mut jump_table = match triple.operating_system {
             OperatingSystem::Windows => create_windows_jump_table(patch, cache)?,
             _ if triple.architecture == Architecture::Wasm32 => {
-                create_wasm_jump_table(patch, cache, self.keep_wasm_names())?
+                create_wasm_jump_table(patch, cache, self.keep_wasm_names(), self.dwarf_sidecar)?
             }
             _ => create_native_jump_table(patch, triple, cache)?,
         };
@@ -1888,10 +1914,13 @@ impl BuildRequest {
             //
             // ie we would've shipped `/Users/foo/Projects/dioxus/target/dx/project/debug/web/public/wasm/lib.wasm`
             //    but we want to ship `/wasm/lib.wasm`
-            jump_table.lib = PathBuf::from(
+            let url_root = PathBuf::from(
                 "/".to_string() + base_path.unwrap_or_default().trim_start_matches('/'),
-            )
-            .join(jump_table.lib.strip_prefix(root_dir).unwrap())
+            );
+            jump_table.lib = url_root.join(jump_table.lib.strip_prefix(&root_dir).unwrap());
+            if let Some(sidecar) = jump_table.dwarf_sidecar.as_mut() {
+                *sidecar = url_root.join(sidecar.strip_prefix(&root_dir).unwrap());
+            }
         }
 
         Ok(jump_table)

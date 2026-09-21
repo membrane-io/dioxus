@@ -894,10 +894,61 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
             );
         }
 
+        let dwarf_sidecar = table.dwarf_sidecar.clone();
         unsafe { commit_patch(table) };
+
+        // The DWARF of the patch, when dx wrote it to a sidecar. The fetch starts after the
+        // patch runs, so it does not delay the patch.
+        if let Some(sidecar) = dwarf_sidecar {
+            attach_dwarf_sidecar(module, sidecar.to_string_lossy().into_owned());
+        }
     });
 
     Ok(())
+}
+
+/// Fetch the DWARF sidecar of a patch and attach it to the patch module through
+/// `wasmStackTrace.attachSidecar`, the hook of the wasm-stack-trace library. Stack traces
+/// and the DWARF inspector then read the DWARF of the patch from the sidecar. Without the
+/// hook, the page has no use for the sidecar, and the fetch does not start.
+#[cfg(target_arch = "wasm32")]
+fn attach_dwarf_sidecar(module: js_sys::WebAssembly::Module, url: String) {
+    use js_sys::{Function, Reflect};
+    use wasm_bindgen::{JsCast, JsValue, UnwrapThrowExt};
+    use wasm_bindgen_futures::JsFuture;
+
+    let Ok(hook) = Reflect::get(&js_sys::global(), &JsValue::from_str("wasmStackTrace")) else {
+        return;
+    };
+    let Some(attach) = Reflect::get(&hook, &JsValue::from_str("attachSidecar"))
+        .ok()
+        .and_then(|method| method.dyn_into::<Function>().ok())
+    else {
+        return;
+    };
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let warn = |what: &str| {
+            web_sys::console::warn_1(
+                &format!("[subsecond] the DWARF sidecar {url} did not attach: {what}").into(),
+            );
+        };
+        let Ok(response) =
+            JsFuture::from(web_sys::window().unwrap_throw().fetch_with_str(&url)).await
+        else {
+            return warn("the fetch failed");
+        };
+        let response: web_sys::Response = response.unchecked_into();
+        if !response.ok() {
+            return warn(&format!("status {}", response.status()));
+        }
+        let Ok(buffer) = JsFuture::from(response.array_buffer().unwrap_throw()).await else {
+            return warn("the body did not load");
+        };
+        if attach.call2(&hook, module.as_ref(), &buffer).is_err() {
+            warn("attachSidecar threw");
+        }
+    });
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]

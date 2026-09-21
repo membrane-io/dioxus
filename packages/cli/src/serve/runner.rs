@@ -1051,6 +1051,9 @@ impl AppServer {
             msg.for_build_id = Some(BuildId::PRIMARY.0 as _);
             if let Some(lib) = msg.jump_table.as_mut() {
                 lib.lib = PathBuf::from("/").join(lib.lib.clone());
+                if let Some(sidecar) = lib.dwarf_sidecar.as_mut() {
+                    *sidecar = PathBuf::from("/").join(sidecar.clone());
+                }
             }
         }
 

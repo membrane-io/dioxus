@@ -282,7 +282,7 @@ impl BuildRequest {
             let unstripped_path =
                 post_bindgen_wasm.with_extension(UNSTRIPPED_WASM_EXTENSION);
             std::fs::write(&unstripped_path, &bytes)?;
-            let stripped = crate::build::strip_linker_sidecars(&bytes, self.keep_wasm_names());
+            let stripped = crate::build::strip_linker_sidecars(&bytes, self.keep_wasm_names(), false);
             tracing::debug!(
                 dx_src = ?TraceSrc::Bundle,
                 "stripped linker sidecars from served wasm: {} -> {} bytes",

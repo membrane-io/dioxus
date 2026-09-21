@@ -443,6 +443,7 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         new_base_address,
         aslr_reference,
         ifunc_count: 0,
+        dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
         wasm: None,
         base_id: None,
@@ -497,6 +498,7 @@ pub fn create_native_jump_table(
         new_base_address,
         aslr_reference,
         ifunc_count: 0,
+        dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
         wasm: None,
         base_id: None,
@@ -533,9 +535,26 @@ pub fn create_wasm_jump_table(
     patch: &Path,
     cache: &HotpatchModuleCache,
     keep_names: bool,
+    dwarf_sidecar: bool,
 ) -> Result<JumpTable> {
     let t_start = std::time::Instant::now();
-    let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
+    let linked = std::fs::read(patch).context("Could not read patch file")?;
+
+    // Every defined function of the patch gets a slot in the shared table, so that the jump
+    // table can repoint the base slot of every function that a changed crate holds. The
+    // linker fills the table with the functions whose address the patch takes, and nothing
+    // else. The walrus path reads the patch from disk, so the rewrite goes to disk.
+    let new_bytes = extend_element_segment(&linked)?;
+    std::fs::write(patch, &new_bytes).context("Could not write the patch file")?;
+
+    // With `--dwarf-sidecar`, the served patch carries no DWARF. The linker output, DWARF and
+    // all, goes to `<patch>.dwarf.wasm` next to it, and the runtime attaches that file to the
+    // patch module. The linker does not garbage-collect DWARF, so the DWARF of every linked
+    // object is in the patch: about two thirds of the bytes of a large patch.
+    let sidecar = dwarf_sidecar.then(|| patch.with_extension("dwarf.wasm"));
+    if let Some(sidecar) = &sidecar {
+        std::fs::write(sidecar, &new_bytes).context("Could not write the DWARF sidecar")?;
+    }
 
     // Analyze the patch with a single `wasmparser` pass that skips the code section. The fast path
     // never re-emits the module, so we only need the import/type/function/element/name sections —
@@ -549,10 +568,12 @@ pub fn create_wasm_jump_table(
     // function body, so if any are present we have to take the walrus path that re-encodes the code.
     if analysis.needs_body_rewrite {
         tracing::debug!("Patch needs wbg_cast body rewrite; using walrus jump-table path");
-        return create_wasm_jump_table_walrus(patch, cache, keep_names);
+        return create_wasm_jump_table_walrus(patch, cache, keep_names, sidecar);
     }
 
-    create_wasm_jump_table_fast(patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names)
+    create_wasm_jump_table_fast(
+        patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names, sidecar,
+    )
 }
 
 /// A normalized wasm value type, comparable across the `walrus` (base/cache) and `wasmparser`
@@ -788,6 +809,7 @@ fn create_wasm_jump_table_fast(
     t_start: std::time::Instant,
     t_parsed: std::time::Duration,
     keep_names: bool,
+    dwarf_sidecar: Option<PathBuf>,
 ) -> Result<JumpTable> {
     use subsecond_types::WasmFixups;
 
@@ -889,7 +911,7 @@ fn create_wasm_jump_table_fast(
     // serve, drop the start section, and add the relocs export. The code/data/import sections are
     // copied verbatim, so DWARF stays valid and there's no re-encode.
     let lib = patch.to_path_buf();
-    let bytes = finalize_patch_wasm(new_bytes, reloc_export, keep_names)?;
+    let bytes = finalize_patch_wasm(new_bytes, reloc_export, keep_names, dwarf_sidecar.is_some())?;
     std::fs::write(&lib, bytes)?;
     let t_emitted = t_start.elapsed();
 
@@ -915,6 +937,7 @@ fn create_wasm_jump_table_fast(
         map,
         lib,
         ifunc_count,
+        dwarf_sidecar,
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
@@ -984,6 +1007,7 @@ fn create_wasm_jump_table_walrus(
     patch: &Path,
     cache: &HotpatchModuleCache,
     keep_names: bool,
+    dwarf_sidecar: Option<PathBuf>,
 ) -> Result<JumpTable> {
     let t_start = std::time::Instant::now();
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
@@ -1292,7 +1316,7 @@ fn create_wasm_jump_table_walrus(
     // the browser does not read them and they are commonly 30-50% of the patch size.
     let lib = patch.to_path_buf();
     let bytes = new.emit_wasm();
-    let bytes = strip_linker_sidecars(&bytes, keep_names);
+    let bytes = strip_linker_sidecars(&bytes, keep_names, dwarf_sidecar.is_some());
     std::fs::write(&lib, bytes)?;
     let t_emitted = t_start.elapsed();
 
@@ -1366,6 +1390,7 @@ fn create_wasm_jump_table_walrus(
         map,
         lib,
         ifunc_count,
+        dwarf_sidecar,
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
@@ -1992,7 +2017,7 @@ fn collect_stub_symbols_from_bytes(
 /// custom sections, and copy every other section's bytes verbatim without parsing their
 /// payloads. Cost is ~one memcpy of the input. On a 200 MB wasm it runs in tens of ms,
 /// well below the threshold where it would slow a fat or patch build noticeably.
-pub fn strip_linker_sidecars(input: &[u8], keep_names: bool) -> Vec<u8> {
+pub fn strip_linker_sidecars(input: &[u8], keep_names: bool, strip_dwarf: bool) -> Vec<u8> {
     if input.len() < 8 || &input[..4] != b"\0asm" {
         return input.to_vec();
     }
@@ -2020,7 +2045,7 @@ pub fn strip_linker_sidecars(input: &[u8], keep_names: bool) -> Vec<u8> {
                 let name_end = name_start + name_len as usize;
                 if name_end <= payload_end {
                     if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
-                        if should_strip_custom_section(name, keep_names) {
+                        if should_strip_custom_section(name, keep_names, strip_dwarf) {
                             keep = false;
                         }
                     }
@@ -2085,7 +2110,185 @@ fn find_wasm_func_index_by_name(bytes: &[u8], target: &str) -> Option<u32> {
 ///   3. export `__wasm_apply_global_relocs` so the runtime can call it (wasm-ld refuses to export it).
 ///
 /// Cost is ~one memcpy of the input plus a re-encode of the (tiny) export section.
-fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool) -> Result<Vec<u8>> {
+/// Rewrite the element section of a patch so that the active segment on table 0 lists every
+/// defined function of the patch.
+///
+/// The base module calls a function of another crate through a slot of the shared table. The
+/// jump table repoints that slot to the patch only when the patch holds a function with the same
+/// name in its own element segment. The linker puts a function into the segment only when an
+/// object of the patch takes its address. A function that only a skipped dependent calls has no
+/// such reference, so this pass appends it. The existing items keep their slots, because the
+/// relocation thunk of the patch refers to them by index.
+///
+/// A patch without an element section gets one, with the offset `global.get __table_base`.
+fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
+    const SECTION_ELEMENT: u8 = 9;
+    const SECTION_CODE: u8 = 10;
+
+    if input.len() < 8 || &input[..4] != b"\0asm" {
+        return Ok(input.to_vec());
+    }
+
+    // First pass: the function index space and the `__table_base` global.
+    let mut imported_funcs = 0u32;
+    let mut imported_globals = 0u32;
+    let mut table_base_global = None;
+    let mut defined_funcs = 0u32;
+    for payload in wasmparser::Parser::new(0).parse_all(input) {
+        match payload? {
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import?;
+                    match import.ty {
+                        wasmparser::TypeRef::Func(_) => imported_funcs += 1,
+                        wasmparser::TypeRef::Global(_) => {
+                            if import.name == "__table_base" {
+                                table_base_global = Some(imported_globals);
+                            }
+                            imported_globals += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => defined_funcs = reader.count(),
+            Payload::CodeSectionStart { .. } => break,
+            _ => {}
+        }
+    }
+    if defined_funcs == 0 {
+        return Ok(input.to_vec());
+    }
+
+    // Second pass: find the element section by a header scan, so that the splice keeps every
+    // other section byte for byte.
+    let mut pos = 8;
+    let mut element: Option<(usize, usize, usize)> = None; // (section start, payload start, end)
+    let mut code_start = None;
+    while pos < input.len() {
+        let section_start = pos;
+        let section_id = input[pos];
+        pos += 1;
+        let Some((section_size, leb_len)) = read_uleb128(&input[pos..]) else {
+            return Ok(input.to_vec());
+        };
+        pos += leb_len;
+        let payload_start = pos;
+        let payload_end = pos + section_size as usize;
+        if payload_end > input.len() {
+            return Ok(input.to_vec());
+        }
+        pos = payload_end;
+        match section_id {
+            SECTION_ELEMENT => element = Some((section_start, payload_start, payload_end)),
+            SECTION_CODE if code_start.is_none() => code_start = Some(section_start),
+            _ => {}
+        }
+    }
+
+    // The segments of the existing section. The target is the first active segment on table 0
+    // with a `global.get` offset. Every other segment is copied as is.
+    let mut segments: Vec<Vec<u8>> = Vec::new();
+    let mut target: Option<(usize, Vec<u8>, Vec<u32>)> = None; // (position, offset expr, items)
+    if let Some((_, payload_start, payload_end)) = element {
+        let payload = &input[payload_start..payload_end];
+        let reader =
+            wasmparser::ElementSectionReader::new(BinaryReader::new(payload, payload_start))?;
+        for segment in reader {
+            let segment = segment?;
+            let raw = input[segment.range.start..segment.range.end].to_vec();
+            if target.is_none() {
+                if let wasmparser::ElementKind::Active {
+                    table_index,
+                    offset_expr,
+                } = &segment.kind
+                {
+                    let mut expr = offset_expr.get_binary_reader();
+                    let expr_bytes = expr.read_bytes(expr.bytes_remaining())?.to_vec();
+                    let is_global_get = matches!(
+                        offset_expr.get_operators_reader().read()?,
+                        wasmparser::Operator::GlobalGet { .. }
+                    );
+                    if table_index.unwrap_or(0) == 0 && is_global_get {
+                        if let wasmparser::ElementItems::Functions(funcs) = segment.items {
+                            let ids = funcs
+                                .into_iter()
+                                .collect::<std::result::Result<Vec<u32>, _>>()?;
+                            target = Some((segments.len(), expr_bytes, ids));
+                            segments.push(Vec::new());
+                            continue;
+                        }
+                    }
+                }
+            }
+            segments.push(raw);
+        }
+    }
+    let (position, offset_expr, mut ids) = match target {
+        Some(target) => target,
+        None => {
+            let Some(global) = table_base_global else {
+                tracing::debug!("The patch has no `__table_base` global; the element segment stays");
+                return Ok(input.to_vec());
+            };
+            let mut expr = vec![0x23]; // global.get
+            write_uleb128(&mut expr, global);
+            expr.push(0x0b); // end
+            segments.push(Vec::new());
+            (segments.len() - 1, expr, Vec::new())
+        }
+    };
+
+    let present: HashSet<u32> = ids.iter().copied().collect();
+    let added = (imported_funcs..imported_funcs + defined_funcs)
+        .filter(|id| !present.contains(id))
+        .collect::<Vec<_>>();
+    tracing::debug!(
+        "Element segment: {} functions from the linker, {} appended",
+        ids.len(),
+        added.len()
+    );
+    ids.extend(added);
+
+    let mut segment = vec![0x00]; // flags: active, table 0, funcref indices
+    segment.extend_from_slice(&offset_expr);
+    write_uleb128(&mut segment, ids.len() as u32);
+    for id in &ids {
+        write_uleb128(&mut segment, *id);
+    }
+    segments[position] = segment;
+
+    let mut payload = Vec::new();
+    write_uleb128(&mut payload, segments.len() as u32);
+    for segment in &segments {
+        payload.extend_from_slice(segment);
+    }
+    let mut section = vec![SECTION_ELEMENT];
+    write_uleb128(&mut section, payload.len() as u32);
+    section.extend_from_slice(&payload);
+
+    let (splice_start, splice_end) = match element {
+        Some((section_start, _, payload_end)) => (section_start, payload_end),
+        None => {
+            let Some(code_start) = code_start else {
+                return Ok(input.to_vec());
+            };
+            (code_start, code_start)
+        }
+    };
+    let mut out = Vec::with_capacity(input.len() + section.len());
+    out.extend_from_slice(&input[..splice_start]);
+    out.extend_from_slice(&section);
+    out.extend_from_slice(&input[splice_end..]);
+    Ok(out)
+}
+
+fn finalize_patch_wasm(
+    input: &[u8],
+    reloc_export: Option<u32>,
+    keep_names: bool,
+    strip_dwarf: bool,
+) -> Result<Vec<u8>> {
     const SECTION_EXPORT: u8 = 7;
     const SECTION_START: u8 = 8;
 
@@ -2116,8 +2319,8 @@ fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool
         // If the module had no export section (patches always do, but be safe), synthesize one right
         // before the first ordered section that must follow it.
         if !export_emitted && section_id != 0 && section_id > SECTION_EXPORT {
-            if let Some(idx) = reloc_export {
-                out.extend_from_slice(&encode_export_section(&[], idx));
+            if reloc_export.is_some() {
+                out.extend_from_slice(&encode_export_section(&[], reloc_export));
             }
             export_emitted = true;
         }
@@ -2130,7 +2333,7 @@ fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool
                     let name_end = name_start + name_len as usize;
                     if name_end <= payload_end {
                         if let Ok(name) = std::str::from_utf8(&input[name_start..name_end]) {
-                            if should_strip_custom_section(name, keep_names) {
+                            if should_strip_custom_section(name, keep_names, strip_dwarf) {
                                 keep = false;
                             }
                         }
@@ -2142,13 +2345,10 @@ fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool
             }
             SECTION_START => { /* drop: never auto-run patch code */ }
             SECTION_EXPORT => {
-                match reloc_export {
-                    Some(idx) => out.extend_from_slice(&encode_export_section(
-                        &input[payload_start..payload_end],
-                        idx,
-                    )),
-                    None => out.extend_from_slice(&input[section_start..payload_end]),
-                }
+                out.extend_from_slice(&encode_export_section(
+                    &input[payload_start..payload_end],
+                    reloc_export,
+                ));
                 export_emitted = true;
             }
             _ => out.extend_from_slice(&input[section_start..payload_end]),
@@ -2158,29 +2358,57 @@ fn finalize_patch_wasm(input: &[u8], reloc_export: Option<u32>, keep_names: bool
     Ok(out)
 }
 
-/// Re-encode the export section, appending an `__wasm_apply_global_relocs` function export.
+/// Re-encode the export section: keep the exports that the runtime calls, and append the
+/// `__wasm_apply_global_relocs` function export when `reloc_export` names its index.
 ///
-/// `existing_payload` is the original export section payload (`count` followed by the entries), or
-/// empty to synthesize a fresh section. Existing entries are copied verbatim; only the count and the
-/// one new entry are encoded.
-fn encode_export_section(existing_payload: &[u8], func_index: u32) -> Vec<u8> {
+/// The thin link exports every function of the base table, because those exports are the
+/// roots of the link. The runtime does not call them, and the export names cost as much as
+/// the `name` section, so this pass keeps `main` and the relocation and constructor thunks
+/// only. `existing_payload` is the original export section payload, `count` followed by the
+/// entries, or empty to synthesize a fresh section.
+fn encode_export_section(existing_payload: &[u8], reloc_export: Option<u32>) -> Vec<u8> {
     const NAME: &str = "__wasm_apply_global_relocs";
+    const KEEP: [&str; 3] = ["main", "__wasm_apply_data_relocs", "__wasm_call_ctors"];
 
-    let (count, entries): (u32, &[u8]) = match read_uleb128(existing_payload) {
+    let (count, mut entries): (u32, &[u8]) = match read_uleb128(existing_payload) {
         Some((c, l)) => (c, &existing_payload[l..]),
         None => (0, &[]),
     };
 
-    let mut new_entry = Vec::new();
-    write_uleb128(&mut new_entry, NAME.len() as u32);
-    new_entry.extend_from_slice(NAME.as_bytes());
-    new_entry.push(0x00); // export kind: function
-    write_uleb128(&mut new_entry, func_index);
+    let mut kept = Vec::new();
+    let mut kept_count = 0u32;
+    for _ in 0..count {
+        // An entry is: name length, name bytes, kind byte, index.
+        let Some((name_len, name_leb)) = read_uleb128(entries) else {
+            break;
+        };
+        let name_end = name_leb + name_len as usize;
+        let Some((_, index_leb)) = entries
+            .get(name_end + 1..)
+            .and_then(read_uleb128)
+        else {
+            break;
+        };
+        let entry_end = name_end + 1 + index_leb;
+        let name = std::str::from_utf8(&entries[name_leb..name_end]).unwrap_or("");
+        if KEEP.contains(&name) || name == NAME {
+            kept.extend_from_slice(&entries[..entry_end]);
+            kept_count += 1;
+        }
+        entries = &entries[entry_end..];
+    }
+
+    if let Some(func_index) = reloc_export {
+        write_uleb128(&mut kept, NAME.len() as u32);
+        kept.extend_from_slice(NAME.as_bytes());
+        kept.push(0x00); // export kind: function
+        write_uleb128(&mut kept, func_index);
+        kept_count += 1;
+    }
 
     let mut payload = Vec::new();
-    write_uleb128(&mut payload, count + 1);
-    payload.extend_from_slice(entries);
-    payload.extend_from_slice(&new_entry);
+    write_uleb128(&mut payload, kept_count);
+    payload.extend_from_slice(&kept);
 
     let mut section = vec![0x07u8]; // export section id
     write_uleb128(&mut section, payload.len() as u32);
@@ -2217,9 +2445,15 @@ fn write_uleb128(out: &mut Vec<u8>, mut value: u32) {
 /// `keep_names` (from the `--keep-names` CLI flag) preserves the `name` section: tools like
 /// `console_error_panic_hook` print human-readable backtraces from it without a browser extension,
 /// which is worth the extra bytes when profiling/debugging.
-fn should_strip_custom_section(name: &str, keep_names: bool) -> bool {
+///
+/// `strip_dwarf` removes every `.debug_*` section. The build with `--dwarf-sidecar` writes the
+/// DWARF to a sidecar file, so the served module does not need it.
+fn should_strip_custom_section(name: &str, keep_names: bool, strip_dwarf: bool) -> bool {
     if name == "name" {
         return !keep_names;
+    }
+    if strip_dwarf && name.starts_with(".debug_") {
+        return true;
     }
     name.starts_with("reloc.")
         || name.contains("manganis")
@@ -2675,7 +2909,7 @@ fn strip_linker_sidecars_bench() {
     let mut last = Vec::new();
     for _ in 0..runs {
         let start = std::time::Instant::now();
-        last = strip_linker_sidecars(&bytes, false);
+        last = strip_linker_sidecars(&bytes, false, false);
         let elapsed = start.elapsed();
         times_ms.push(elapsed.as_secs_f64() * 1000.0);
     }
@@ -2750,6 +2984,76 @@ fn find_reloc_index_probe() {
 }
 
 #[test]
+fn extend_element_segment_lists_every_defined_function() {
+    fn section(id: u8, payload: &[u8]) -> Vec<u8> {
+        let mut s = vec![id];
+        write_uleb128(&mut s, payload.len() as u32);
+        s.extend_from_slice(payload);
+        s
+    }
+    fn segments_of(module: &[u8]) -> Vec<Vec<u32>> {
+        let mut out = Vec::new();
+        for payload in wasmparser::Parser::new(0).parse_all(module) {
+            if let Payload::ElementSection(reader) = payload.expect("the module must parse") {
+                for segment in reader {
+                    let segment = segment.unwrap();
+                    let wasmparser::ElementItems::Functions(funcs) = segment.items else {
+                        panic!("expected function indices");
+                    };
+                    out.push(funcs.into_iter().map(|f| f.unwrap()).collect());
+                }
+            }
+        }
+        out
+    }
+
+    // type: () -> ()
+    let types = section(1, &[0x01, 0x60, 0x00, 0x00]);
+    // imports: one function `env.f` of type 0, one global `env.__table_base` (i32, const)
+    let mut imports = Vec::new();
+    write_uleb128(&mut imports, 2);
+    for (name, desc) in [("f", vec![0x00u8, 0x00]), ("__table_base", vec![0x03, 0x7f, 0x00])] {
+        write_uleb128(&mut imports, 3);
+        imports.extend_from_slice(b"env");
+        write_uleb128(&mut imports, name.len() as u32);
+        imports.extend_from_slice(name.as_bytes());
+        imports.extend_from_slice(&desc);
+    }
+    let imports = section(2, &imports);
+    // three defined functions of type 0: indices 1, 2 and 3
+    let funcs = section(3, &[0x03, 0x00, 0x00, 0x00]);
+    // code: three empty bodies
+    let mut code = Vec::new();
+    write_uleb128(&mut code, 3);
+    for _ in 0..3 {
+        code.extend_from_slice(&[0x02, 0x00, 0x0b]);
+    }
+    let code = section(10, &code);
+
+    let mut head = Vec::new();
+    head.extend_from_slice(b"\0asm");
+    head.extend_from_slice(&1u32.to_le_bytes());
+    head.extend_from_slice(&types);
+    head.extend_from_slice(&imports);
+    head.extend_from_slice(&funcs);
+
+    // A module whose linker segment holds function 2 only: the pass appends 1 and 3 after it.
+    let mut with_segment = head.clone();
+    with_segment.extend_from_slice(&section(9, &[0x01, 0x00, 0x23, 0x00, 0x0b, 0x01, 0x02]));
+    with_segment.extend_from_slice(&code);
+    let out = extend_element_segment(&with_segment).unwrap();
+    assert_eq!(segments_of(&out), vec![vec![2, 1, 3]]);
+    assert!(out.ends_with(&code), "the code section stays as it was");
+
+    // A module without an element section gets one before the code section.
+    let mut without = head.clone();
+    without.extend_from_slice(&code);
+    let out = extend_element_segment(&without).unwrap();
+    assert_eq!(segments_of(&out), vec![vec![1, 2, 3]]);
+    assert!(out.ends_with(&code), "the code section stays as it was");
+}
+
+#[test]
 fn finalize_patch_wasm_edits() {
     use std::collections::HashSet;
 
@@ -2774,13 +3078,15 @@ fn finalize_patch_wasm_edits() {
     m.extend_from_slice(&section(1, &[0x01, 0x60, 0x00, 0x00]));
     // func: one function of type 0
     m.extend_from_slice(&section(3, &[0x01, 0x00]));
-    // export: "main" -> func 0
+    // export: "main" -> func 0, and a linker root "extra" -> func 0 that must go
     let mut exp = Vec::new();
-    write_uleb128(&mut exp, 1);
-    write_uleb128(&mut exp, 4);
-    exp.extend_from_slice(b"main");
-    exp.push(0x00);
-    write_uleb128(&mut exp, 0);
+    write_uleb128(&mut exp, 2);
+    for name in ["main", "extra"] {
+        write_uleb128(&mut exp, name.len() as u32);
+        exp.extend_from_slice(name.as_bytes());
+        exp.push(0x00);
+        write_uleb128(&mut exp, 0);
+    }
     m.extend_from_slice(&section(7, &exp));
     // start: func 0 (must be dropped)
     m.extend_from_slice(&section(8, &[0x00]));
@@ -2797,7 +3103,7 @@ fn finalize_patch_wasm_edits() {
     m.extend_from_slice(&custom("manganis", &[0x03]));
     m.extend_from_slice(&custom("dylink.0", &[0x04]));
 
-    let out = finalize_patch_wasm(&m, Some(0), false).unwrap();
+    let out = finalize_patch_wasm(&m, Some(0), false, false).unwrap();
 
     let mut has_start = false;
     let mut exports = HashSet::new();
@@ -2819,6 +3125,7 @@ fn finalize_patch_wasm_edits() {
 
     assert!(!has_start, "start section should be dropped");
     assert!(exports.contains("main"), "existing exports preserved");
+    assert!(!exports.contains("extra"), "a linker root export is dropped");
     assert!(
         exports.contains("__wasm_apply_global_relocs"),
         "relocs export added"
@@ -2829,7 +3136,7 @@ fn finalize_patch_wasm_edits() {
     assert!(customs.contains("dylink.0"), "dylink preserved");
 
     // With keep_names, the `name` section survives while everything else is still stripped.
-    let kept = finalize_patch_wasm(&m, Some(0), true).unwrap();
+    let kept = finalize_patch_wasm(&m, Some(0), true, false).unwrap();
     let mut kept_customs = HashSet::new();
     for payload in wasmparser::Parser::new(0).parse_all(&kept) {
         if let Payload::CustomSection(s) = payload.expect("finalized wasm must parse") {
@@ -2838,6 +3145,18 @@ fn finalize_patch_wasm_edits() {
     }
     assert!(kept_customs.contains("name"), "name section kept with --keep-names");
     assert!(!kept_customs.contains("manganis"), "manganis still stripped");
+
+    // With a DWARF sidecar, the `.debug_*` sections go too, and the `name` section stays.
+    let split = finalize_patch_wasm(&m, Some(0), true, true).unwrap();
+    let mut split_customs = HashSet::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&split) {
+        if let Payload::CustomSection(s) = payload.expect("finalized wasm must parse") {
+            split_customs.insert(s.name().to_string());
+        }
+    }
+    assert!(!split_customs.contains(".debug_info"), "DWARF stripped with a sidecar");
+    assert!(split_customs.contains("name"), "name section kept with a sidecar");
+    assert!(split_customs.contains("dylink.0"), "dylink preserved with a sidecar");
 }
 
 /// Manually parse the data section from a wasm module

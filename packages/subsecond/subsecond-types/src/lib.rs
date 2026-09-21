@@ -45,6 +45,12 @@ pub struct JumpTable {
     /// for the ifuncs in the ifunc table
     pub ifunc_count: u64,
 
+    /// (wasm only) The DWARF sidecar of `lib`, when dx moved the DWARF of the patch out of the
+    /// served bytes. The runtime fetches it after the patch runs and attaches it to the patch
+    /// module through `wasmStackTrace`, so that stack traces and the DWARF inspector read it.
+    #[serde(default)]
+    pub dwarf_sidecar: Option<PathBuf>,
+
     /// (wasm only) Pairs of `(old_ifunc_index, new_ifunc_index)` whose old/new functions have
     /// identical wasm signatures and are therefore safe to overwrite in place in the indirect
     /// function table after the patch is instantiated.
