@@ -72,8 +72,6 @@ pub struct HotpatchModuleCache {
 
     // .... wasm stuff
     pub symbol_ifunc_map: HashMap<String, i32>,
-    pub old_wasm: Module,
-    pub old_bytes: Vec<u8>,
     pub old_exports: HashSet<String>,
     pub old_imports: HashSet<String>,
 
@@ -366,11 +364,9 @@ impl HotpatchModuleCache {
 
                 HotpatchModuleCache {
                     path: original.to_path_buf(),
-                    old_bytes: bytes,
                     symbol_ifunc_map,
                     old_exports,
                     old_imports,
-                    old_wasm: module,
                     base_id,
                     data_symbol_offsets,
                     ifunc_sigs,
@@ -456,7 +452,6 @@ impl HotpatchModuleCache {
                 HotpatchModuleCache {
                     symbol_table,
                     path: original.to_path_buf(),
-                    old_bytes,
                     tls_init_data,
                     tls_init_sizes,
                     ..Default::default()
@@ -1125,9 +1120,6 @@ fn create_wasm_jump_table_walrus(
 ) -> Result<JumpTable> {
     let t_start = std::time::Instant::now();
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
-    let old = &cache.old_wasm;
-    let old_symbols =
-        parse_bytes_to_data_segment(&cache.old_bytes).context("Failed to parse data segment")?;
     let new_bytes = std::fs::read(patch).context("Could not read patch file")?;
     let t_read = t_start.elapsed();
 
@@ -1242,41 +1234,16 @@ fn create_wasm_jump_table_walrus(
     // the names of the data segments, but otherwise this system works well.
     //
     // We simply use the name of the import as a key into the symbol table and then its offset into
-    // its data segment as the value within the global.
+    // its data segment as the value within the global. The cache holds the offset of every data
+    // symbol of the base, see `data_symbol_offsets`.
     for mem in got_mems {
         let import = new.imports.get(mem);
-        let data_symbol_idx = *old_symbols
-            .data_symbol_map
+        let offset = *cache
+            .data_symbol_offsets
             .get(import.name.as_str())
             .with_context(|| {
                 format!("Failed to find GOT.mem import by its name: {}", import.name)
             })?;
-        let data_symbol = old_symbols
-            .data_symbols
-            .get(&data_symbol_idx)
-            .context("Failed to find data symbol by its index")?;
-        let data = old
-            .data
-            .iter()
-            .nth(data_symbol.which_data_segment)
-            .context("Missing data segment in the main module")?;
-
-        let offset = match data.kind {
-            DataKind::Active {
-                offset: ConstExpr::Value(walrus::ir::Value::I32(idx)),
-                ..
-            } => idx,
-            DataKind::Active {
-                offset: ConstExpr::Value(walrus::ir::Value::I64(idx)),
-                ..
-            } => idx as i32,
-            _ => {
-                return Err(PatchError::InvalidModule(format!(
-                    "Data segment of invalid table: {:?}",
-                    data.kind
-                )));
-            }
-        };
 
         let ImportKind::Global(global_id) = import.kind else {
             return Err(PatchError::InvalidModule(
@@ -1287,9 +1254,8 @@ fn create_wasm_jump_table_walrus(
         // "satisfying" the import means removing it from the import table and replacing its target
         // value with a local global.
         new.imports.delete(mem);
-        new.globals.get_mut(global_id).kind = walrus::GlobalKind::Local(ConstExpr::Value(
-            walrus::ir::Value::I32(offset + data_symbol.segment_offset as i32),
-        ));
+        new.globals.get_mut(global_id).kind =
+            walrus::GlobalKind::Local(ConstExpr::Value(walrus::ir::Value::I32(offset)));
     }
 
     // wasm-bindgen has a limit on the number of exports a module can have, so we need to call the main
@@ -1465,8 +1431,19 @@ fn create_wasm_jump_table_walrus(
     // matched by name and, at high opt levels, several differently-typed symbols can collapse onto
     // one ifunc index, so a name-matched pair may otherwise install a wrong-signature funcref and
     // corrupt unrelated `call_indirect` sites.
-    let old_sigs = collect_ifunc_signatures(old);
-    let new_sigs = collect_ifunc_signatures(&new);
+    let old_sigs = &cache.ifunc_sigs;
+    let new_sigs: HashMap<i32, SigVec> = collect_ifunc_signatures(&new)
+        .into_iter()
+        .map(|(idx, (params, results))| {
+            (
+                idx,
+                (
+                    params.iter().map(walrus_valtype_sig).collect(),
+                    results.iter().map(walrus_valtype_sig).collect(),
+                ),
+            )
+        })
+        .collect();
     let mut ifunc_repoint = Vec::new();
     for (&old_idx, &new_idx) in map.iter() {
         if let (Some(old_sig), Some(new_sig)) = (
