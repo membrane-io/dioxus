@@ -1948,6 +1948,30 @@ impl BuildRequest {
         cargo_args
     }
 
+    /// The RUSTFLAGS of a build: the flags of the cargo config, and the flags that dx adds
+    /// for the build mode.
+    ///
+    /// A fat build for hot-patching compiles every wasm crate as PIC. A patch links the
+    /// rlibs of the workspace crates between the tip and a changed crate, without a new
+    /// compile of those crates, and the linker accepts only PIC objects in a PIE patch. The
+    /// tip also keeps its incremental cache between the fat compile and the thin compile,
+    /// because both use the same relocation model.
+    ///
+    /// The scope of the captured rustc args hashes these flags too. Cargo puts the flags
+    /// into the metadata hash of every crate, so a build with other flags writes other
+    /// rlibs. A captured args file from a build with other flags names an rlib that the
+    /// fat build did not link, and cargo does not compile the crate again when it finds the
+    /// rlib of the current flags fresh. The scope keeps such args out of the patch link.
+    pub(crate) fn build_rustflags(&self, build_mode: &BuildMode) -> cargo_config2::Flags {
+        let mut rust_flags = self.rustflags.clone();
+        if matches!(build_mode, BuildMode::Fat) && self.is_wasm_or_wasi() {
+            rust_flags
+                .flags
+                .push("-Crelocation-model=pic".to_string());
+        }
+        rust_flags
+    }
+
     pub(crate) fn cargo_build_env_vars(
         &self,
         build_mode: &BuildMode,
@@ -1975,19 +1999,7 @@ impl BuildRequest {
             ));
         }
 
-        // Assemble the rustflags by peering into the `.cargo/config.toml` file
-        let mut rust_flags = self.rustflags.clone();
-
-        // A fat build for hot-patching compiles every wasm crate as PIC. A patch links the
-        // rlibs of the workspace crates between the tip and a changed crate, without a new
-        // compile of those crates, and the linker accepts only PIC objects in a PIE patch. The
-        // tip also keeps its incremental cache between the fat compile and the thin compile,
-        // because both use the same relocation model.
-        if matches!(build_mode, BuildMode::Fat) && self.is_wasm_or_wasi() {
-            rust_flags
-                .flags
-                .push("-Crelocation-model=pic".to_string());
-        }
+        let rust_flags = self.build_rustflags(build_mode);
 
         // Set the rust flags for the build if they're not empty.
         if !rust_flags.flags.is_empty() {

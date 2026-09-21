@@ -2147,7 +2147,7 @@ impl BuildRequest {
             rustc_version: self.workspace.rustc_version.clone(),
             features: self.features.clone(),
             all_features: self.all_features,
-            rustflags: self.rustflags.flags.clone(),
+            rustflags: self.build_rustflags(build_mode).flags,
             extra_cargo_args: self.extra_cargo_args.clone(),
             extra_rustc_args: self.extra_rustc_args.clone(),
         };
