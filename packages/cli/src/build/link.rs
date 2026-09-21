@@ -243,6 +243,13 @@ impl BuildRequest {
         let mut link_crates = modified_crates.clone();
         link_crates.extend(out_of_place_crates.iter().cloned());
 
+        // The patch runs the code of the tip and calls into the base module for every crate
+        // that the link leaves out. So a call from the tip to a changed function must pass
+        // through patch code only: the patch links the rlib of every workspace crate between
+        // the tip and a changed crate. Those rlibs come from the fat build, which compiled
+        // them as PIC, or from an earlier in-place replay. They do not compile again.
+        link_crates.extend(self.workspace_dependents_cascade(out_of_place_crates));
+
         let attempt = self
             .compile_workspace_hotpatch_attempt(
                 ctx,

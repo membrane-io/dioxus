@@ -1976,7 +1976,18 @@ impl BuildRequest {
         }
 
         // Assemble the rustflags by peering into the `.cargo/config.toml` file
-        let rust_flags = self.rustflags.clone();
+        let mut rust_flags = self.rustflags.clone();
+
+        // A fat build for hot-patching compiles every wasm crate as PIC. A patch links the
+        // rlibs of the workspace crates between the tip and a changed crate, without a new
+        // compile of those crates, and the linker accepts only PIC objects in a PIE patch. The
+        // tip also keeps its incremental cache between the fat compile and the thin compile,
+        // because both use the same relocation model.
+        if matches!(build_mode, BuildMode::Fat) && self.is_wasm_or_wasi() {
+            rust_flags
+                .flags
+                .push("-Crelocation-model=pic".to_string());
+        }
 
         // Set the rust flags for the build if they're not empty.
         if !rust_flags.flags.is_empty() {
