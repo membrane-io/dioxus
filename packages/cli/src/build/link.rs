@@ -51,6 +51,17 @@ impl std::fmt::Display for ReplayFailed {
     }
 }
 
+/// Marks a thin build whose edit changed no function since the fat build. A cascade compiles
+/// the same functions again, so the fallback of the interface gate must not retry it.
+#[derive(Debug)]
+struct NothingToPatch;
+
+impl std::fmt::Display for NothingToPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No function changed since the fat build, so there is nothing to patch")
+    }
+}
+
 /// The tip compile of one thin build: the exe, the link args that name the tip objects, and
 /// the dep-info of the tip.
 struct TipBuild {
@@ -270,10 +281,12 @@ impl BuildRequest {
             // The interface gate is a heuristic. When a gated patch fails after its replay, the
             // gate can have missed an interface change: replay the changed crates in place with
             // their full dependent cascade, as an ungated patch does. A failed replay is a
-            // compile error in the changed crate itself, and a cascade cannot fix it.
+            // compile error in the changed crate itself, and a cascade cannot fix it. An edit
+            // that changed no function gives the cascade nothing to link either.
             Err(err)
                 if !replay_out_of_place.is_empty()
-                    && err.downcast_ref::<ReplayFailed>().is_none() =>
+                    && err.downcast_ref::<ReplayFailed>().is_none()
+                    && err.downcast_ref::<NothingToPatch>().is_none() =>
             {
                 tracing::warn!(
                     "The gated patch for {replay_out_of_place:?} failed: {err:#}. \
@@ -615,7 +628,10 @@ impl BuildRequest {
             wanted.extend(earlier_functions.needed.iter().copied());
             wanted.extend(earlier.iter().map(String::as_str));
             if wanted.is_empty() {
-                bail!("No function changed since the fat build, so there is nothing to patch");
+                return Err(anyhow::anyhow!(
+                    "the link input holds no function that differs from the fat build"
+                )
+                .context(NothingToPatch));
             }
             cache
                 .patched_functions
