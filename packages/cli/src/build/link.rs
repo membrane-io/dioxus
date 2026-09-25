@@ -245,6 +245,7 @@ impl BuildRequest {
             replay_in_place,
             replay_out_of_place,
             out_of_place_crates,
+            additive_crates,
             previous_tip,
             ..
         } = &ctx.mode
@@ -281,18 +282,24 @@ impl BuildRequest {
             // The interface gate is a heuristic. When a gated patch fails after its replay, the
             // gate can have missed an interface change: replay the changed crates in place with
             // their full dependent cascade, as an ungated patch does. A failed replay is a
-            // compile error in the changed crate itself, and a cascade cannot fix it. An edit
-            // that changed no function gives the cascade nothing to link either.
+            // compile error in the changed crate itself, and a cascade cannot fix it, unless an
+            // additive crate holds a new item that the failed crate uses: the replay compiled
+            // against the old metadata. The tip compiles against the old metadata too, so a
+            // tip error with an additive crate gets the same retry. An edit that changed no
+            // function gives the cascade nothing to link either.
             Err(err)
-                if !replay_out_of_place.is_empty()
-                    && err.downcast_ref::<ReplayFailed>().is_none()
+                if (!replay_out_of_place.is_empty() || !additive_crates.is_empty())
+                    && (err.downcast_ref::<ReplayFailed>().is_none()
+                        || !additive_crates.is_empty())
                     && err.downcast_ref::<NothingToPatch>().is_none() =>
             {
+                let mut roots = replay_out_of_place.clone();
+                roots.extend(additive_crates.iter().cloned());
                 tracing::warn!(
-                    "The gated patch for {replay_out_of_place:?} failed: {err:#}. \
+                    "The gated patch for {roots:?} failed: {err:#}. \
                      Retrying with the full dependent cascade."
                 );
-                let cascade = self.workspace_dependents_cascade(replay_out_of_place);
+                let cascade = self.workspace_dependents_cascade(&roots);
                 let mut in_place = replay_in_place.clone();
                 in_place.extend(cascade.iter().cloned());
                 let mut out_of_place = out_of_place_crates.clone();

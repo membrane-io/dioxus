@@ -325,6 +325,12 @@ pub enum BuildMode {
         /// of the ones in the cargo target directory.
         out_of_place_crates: HashSet<String>,
 
+        /// The out-of-place crates with an additive change since the fat build: a new item
+        /// that the old metadata in the cargo target directory does not hold. A compile error
+        /// in the tip or in a replay can come from a use of such an item, so the build retries
+        /// with the cascade of these crates.
+        additive_crates: HashSet<String>,
+
         /// The tip objects of the previous patch. The builder sets this when the tip did not
         /// change since that patch. The thin build links these objects instead of a new tip
         /// compile, unless a crate replays in place.

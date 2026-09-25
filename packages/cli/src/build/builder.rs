@@ -130,6 +130,10 @@ pub(crate) struct AppBuilder {
     /// patch keeps them here, so that the next patch still replays their dependents.
     pub pending_interface_changes: HashSet<String>,
 
+    /// The out-of-place crates with an additive change since the fat build. See
+    /// `BuildMode::Thin::additive_crates`.
+    pub additive_crates: HashSet<String>,
+
     /// The artifacts of the last thin build that compiled the tip. A patch that does not change
     /// the tip and replays nothing in place links the tip objects of this build again. The
     /// builder clears it when a patch needs a fresh tip compile, so that a failed patch cannot
@@ -197,6 +201,7 @@ impl AppBuilder {
             modified_crates: HashSet::new(),
             out_of_place_crates: HashSet::new(),
             pending_interface_changes: HashSet::new(),
+            additive_crates: HashSet::new(),
             last_thin_artifacts: None,
             profile_spans: Vec::new(),
         })
@@ -353,6 +358,7 @@ impl AppBuilder {
                 for crate_name in &bundle.replayed_in_place {
                     self.modified_crates.insert(crate_name.clone());
                     self.out_of_place_crates.remove(crate_name);
+                    self.additive_crates.remove(crate_name);
                 }
 
                 if let BuildMode::Thin {
@@ -428,6 +434,7 @@ impl AppBuilder {
         changed_files: Vec<PathBuf>,
         changed_crates: Vec<String>,
         interface_changed_crates: HashSet<String>,
+        additive_changed_crates: HashSet<String>,
         verify_skipped: bool,
         build_id: BuildId,
     ) {
@@ -505,6 +512,7 @@ impl AppBuilder {
         }
         for c in &replay_in_place {
             self.out_of_place_crates.remove(c);
+            self.additive_crates.remove(c);
         }
 
         // Every other changed crate replays out of place.
@@ -515,16 +523,23 @@ impl AppBuilder {
             .collect();
         self.out_of_place_crates
             .extend(replay_out_of_place.iter().cloned());
+        self.additive_crates.extend(
+            additive_changed_crates
+                .into_iter()
+                .filter(|c| replay_out_of_place.contains(c)),
+        );
 
         tracing::debug!(
             "Patch rebuild: changed_crates={:?}, interface_changed={:?}, replay_in_place={:?}, \
-             replay_out_of_place={:?}, modified_crates={:?}, out_of_place_crates={:?}",
+             replay_out_of_place={:?}, modified_crates={:?}, out_of_place_crates={:?}, \
+             additive_crates={:?}",
             changed_crates,
             interface_changed,
             replay_in_place,
             replay_out_of_place,
             self.modified_crates,
             self.out_of_place_crates,
+            self.additive_crates,
         );
 
         // A tip edit or an in-place replay needs a fresh tip compile. Drop the cached tip
@@ -549,6 +564,7 @@ impl AppBuilder {
                     replay_in_place,
                     replay_out_of_place,
                     out_of_place_crates: self.out_of_place_crates.clone(),
+                    additive_crates: self.additive_crates.clone(),
                     previous_tip,
                     verify_skipped,
                     workspace_rustc_args: artifacts.workspace_rustc,
@@ -572,6 +588,7 @@ impl AppBuilder {
         self.modified_crates.clear();
         self.out_of_place_crates.clear();
         self.pending_interface_changes.clear();
+        self.additive_crates.clear();
         self.last_thin_artifacts = None;
         self.profile_spans.clear();
         self.build_task = tokio::spawn({

@@ -27,6 +27,6 @@ pub(crate) use android::AndroidTools;
 pub(crate) use assets::*;
 pub(crate) use builder::*;
 pub(crate) use context::*;
-pub(crate) use interface_gate::interface_change;
+pub(crate) use interface_gate::{interface_change, InterfaceChange};
 pub(crate) use patch::*;
 pub(crate) use request::*;

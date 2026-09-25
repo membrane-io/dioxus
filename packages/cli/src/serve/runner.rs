@@ -1,7 +1,7 @@
 use super::{AppBuilder, ServeUpdate, WebServer};
 use crate::{
     BuildArtifacts, BuildId, BuildMode, BuildTargets, BuilderUpdate, BundleFormat,
-    HotpatchModuleCache, Result, ServeArgs, TailwindCli, TraceSrc, Workspace,
+    HotpatchModuleCache, InterfaceChange, Result, ServeArgs, TailwindCli, TraceSrc, Workspace,
     platform_override::CommandWithPlatformOverrides,
 };
 use anyhow::{Context, bail};
@@ -367,6 +367,19 @@ impl AppServer {
                             if metadata.len() == 0 {
                                 continue;
                             }
+                            // The suite reads this line to measure the latency of the file
+                            // watcher, from the write of the file to the event.
+                            if let Ok(age) = metadata
+                                .modified()
+                                .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+                            {
+                                tracing::debug!(
+                                    dx_src = ?TraceSrc::Dev,
+                                    "File change: {} arrived {}ms after the write",
+                                    path.display(),
+                                    age.as_millis()
+                                );
+                            }
                         }
 
                         files.push(path);
@@ -421,9 +434,11 @@ impl AppServer {
         // when this is true.
         let mut needs_deep_rebuild = false;
 
-        // Files whose edit the interface gate classified as body-only. Their crate replays
-        // alone. Every other changed file counts as an interface change of its crate.
+        // Files whose edit the interface gate classified as body-only or as additive. Their
+        // crate replays alone. Every other changed file counts as an interface change of its
+        // crate.
         let mut body_only_files: HashSet<PathBuf> = HashSet::new();
+        let mut additive_files: HashSet<PathBuf> = HashSet::new();
 
         // We attempt to hotreload rsx blocks without a full rebuild.
         //
@@ -529,10 +544,21 @@ impl AppServer {
                 cached_file.most_recent = Some(new_contents);
 
                 match crate::build::interface_change(&old_file, &new_file) {
-                    None => {
+                    InterfaceChange::Same => {
                         body_only_files.insert(path.clone());
                     }
-                    Some(reason) => tracing::info!(
+                    InterfaceChange::Additive(items) => {
+                        body_only_files.insert(path.clone());
+                        additive_files.insert(path.clone());
+                        tracing::info!(
+                            dx_src = ?TraceSrc::Dev,
+                            "Additive change in {}: {items}. The crate replays alone, and a \
+                             dependent that uses a new item replays with the cascade on its \
+                             first error.",
+                            local_path.display()
+                        );
+                    }
+                    InterfaceChange::Changed(reason) => tracing::info!(
                         dx_src = ?TraceSrc::Dev,
                         "Interface change in {}: {reason}. The dependents of its crate replay too.",
                         local_path.display()
@@ -695,11 +721,16 @@ impl AppServer {
                         .filter(|file| !self.skip_dependents || !body_only_files.contains(*file))
                         .filter_map(|file| self.file_to_workspace_crate(file))
                         .collect();
+                    let additive_changed_crates: HashSet<String> = additive_files
+                        .iter()
+                        .filter_map(|file| self.file_to_workspace_crate(file))
+                        .collect();
 
                     self.client.patch_rebuild(
                         files.to_vec(),
                         changed_crates.clone(),
                         interface_changed_crates.clone(),
+                        additive_changed_crates.clone(),
                         self.verify_skip_dependents,
                         BuildId::PRIMARY,
                     );
@@ -709,6 +740,7 @@ impl AppServer {
                             files.to_vec(),
                             changed_crates,
                             interface_changed_crates,
+                            additive_changed_crates,
                             self.verify_skip_dependents,
                             BuildId::SECONDARY,
                         );

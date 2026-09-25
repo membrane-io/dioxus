@@ -19,6 +19,16 @@
 //! kept part of the file uses that name. A `pub use`, a glob import and a `use` under a `cfg`
 //! attribute always compare exactly.
 //!
+//! An edit that only adds items is an additive change. An existing dependent cannot name a new
+//! free function, a new type or a new inherent method, so the dependents keep their code. The
+//! gate reports the additive change apart from an interface change, and the builder replays
+//! the crate alone. A dependent that then uses the new item fails to compile against the old
+//! metadata, and the builder retries that patch with the cascade. The gate still reports an
+//! interface change for a new trait, a new trait impl, a new macro, a new module, a new
+//! re-export, a new enum variant, a new struct field, and a new inherent method whose name is a
+//! method name of a common standard trait, because each of those can change the code that an
+//! existing dependent compiles.
+//!
 //! Known limit: the automatic cross-crate inlining of small functions at `opt-level >= 1` exports
 //! bodies that the gate treats as opaque. The build must pass
 //! `-Zcross-crate-inline-threshold=never`.
@@ -33,45 +43,47 @@ use syn::{
     Visibility,
 };
 
-/// Returns `true` when `old` and `new` have the same interface: every difference between them
-/// sits in the body of an opaque function, in a doc attribute or in a `#[cfg(test)]` item.
-pub fn same_interface(old: &syn::File, new: &syn::File) -> bool {
-    interface_change(old, new).is_none()
+/// The result of the gate for one edited file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InterfaceChange {
+    /// Every difference sits in the body of an opaque function, in a doc attribute or in a
+    /// `#[cfg(test)]` item.
+    Same,
+    /// The new file adds items that no existing dependent can name. The string lists them.
+    Additive(String),
+    /// The string describes the first item whose interface differs.
+    Changed(String),
 }
 
-/// Returns a description of the first top-level item whose interface differs between `old` and
-/// `new`, or `None` when the two files have the same interface.
-pub fn interface_change(old: &syn::File, new: &syn::File) -> Option<String> {
+/// Returns `true` when `old` and `new` have the same interface.
+pub fn same_interface(old: &syn::File, new: &syn::File) -> bool {
+    interface_change(old, new) == InterfaceChange::Same
+}
+
+/// Compares the interface of `old` and `new`.
+pub fn interface_change(old: &syn::File, new: &syn::File) -> InterfaceChange {
     let mut old = old.clone();
     let mut new = new.clone();
     Stripper.visit_file_mut(&mut old);
     Stripper.visit_file_mut(&mut new);
     if old == new {
-        return None;
+        return InterfaceChange::Same;
     }
     if old.attrs != new.attrs {
-        return Some("the inner attributes of the file".to_string());
+        return InterfaceChange::Changed("the inner attributes of the file".to_string());
     }
 
     let (old_uses, old_rest) = split_private_uses(old.items);
     let (new_uses, new_rest) = split_private_uses(new.items);
-    if old_rest != new_rest {
-        for (old_item, new_item) in old_rest.iter().zip(&new_rest) {
-            if old_item != new_item {
-                return Some(describe_item_change(old_item, new_item));
-            }
-        }
-        return Some(format!(
-            "the item count, {} before and {} after",
-            old_rest.len(),
-            new_rest.len()
-        ));
+    let mut added = Vec::new();
+    if let Err(reason) = added_items(&old_rest, &new_rest, &mut added) {
+        return InterfaceChange::Changed(reason);
     }
 
     let old_bindings = UseBindings::collect(&old_uses);
     let new_bindings = UseBindings::collect(&new_uses);
     if old_bindings.globs != new_bindings.globs {
-        return Some("a glob import".to_string());
+        return InterfaceChange::Changed("a glob import".to_string());
     }
     let mut used = HashSet::new();
     let mut collector = IdentCollector(&mut used);
@@ -85,10 +97,199 @@ pub fn interface_change(old: &syn::File, new: &syn::File) -> Option<String> {
         .collect();
     for name in names {
         if old_bindings.names.get(name) != new_bindings.names.get(name) && used.contains(name) {
-            return Some(format!("the import of {name}"));
+            return InterfaceChange::Changed(format!("the import of {name}"));
         }
     }
-    None
+    if added.is_empty() {
+        InterfaceChange::Same
+    } else {
+        InterfaceChange::Additive(added.join(", "))
+    }
+}
+
+/// Walks `old` and `new` in step. An item of `new` that has no equal item in `old` must be
+/// additive, and every item of `old` must appear in `new`. The walk descends into an inherent
+/// `impl` block and into an inline module with the same header. The result lists the added
+/// items in `added`, or describes the first difference that is not additive.
+fn added_items(old: &[Item], new: &[Item], added: &mut Vec<String>) -> Result<(), String> {
+    let mut i = 0;
+    let mut j = 0;
+    while j < new.len() {
+        if i < old.len() && old[i] == new[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if i < old.len() {
+            match (&old[i], &new[j]) {
+                (Item::Impl(old_impl), Item::Impl(new_impl))
+                    if same_inherent_impl_header(old_impl, new_impl) =>
+                {
+                    added_methods(old_impl, new_impl, added)
+                        .map_err(|_| describe_item_change(&old[i], &new[j]))?;
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                (Item::Mod(old_mod), Item::Mod(new_mod))
+                    if old_mod.ident == new_mod.ident
+                        && old_mod.attrs == new_mod.attrs
+                        && old_mod.vis == new_mod.vis =>
+                {
+                    if let (Some((_, old_content)), Some((_, new_content))) =
+                        (&old_mod.content, &new_mod.content)
+                    {
+                        added_items(old_content, new_content, added)?;
+                        i += 1;
+                        j += 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match additive_item(&new[j]) {
+            Some(name) => {
+                added.push(name);
+                j += 1;
+            }
+            None if i < old.len() => return Err(describe_item_change(&old[i], &new[j])),
+            None => return Err(format!("{} is new", describe_item(&new[j]))),
+        }
+    }
+    if i < old.len() {
+        return Err(format!("{} is not in the new file", describe_item(&old[i])));
+    }
+    Ok(())
+}
+
+/// Returns the description of `item` when an existing dependent cannot name it: a new function,
+/// a new type, a new constant, or an inherent `impl` block whose items are all additive.
+fn additive_item(item: &Item) -> Option<String> {
+    match item {
+        Item::Fn(_)
+        | Item::Struct(_)
+        | Item::Enum(_)
+        | Item::Union(_)
+        | Item::Type(_)
+        | Item::Const(_)
+        | Item::Static(_) => Some(describe_item(item)),
+        Item::Impl(block) if block.trait_.is_none() => {
+            let mut added = Vec::new();
+            added_methods(&syn::ItemImpl { items: Vec::new(), ..block.clone() }, block, &mut added)
+                .ok()?;
+            Some(describe_item(item))
+        }
+        _ => None,
+    }
+}
+
+fn same_inherent_impl_header(old: &syn::ItemImpl, new: &syn::ItemImpl) -> bool {
+    old.trait_.is_none()
+        && new.trait_.is_none()
+        && old.attrs == new.attrs
+        && old.generics == new.generics
+        && old.self_ty == new.self_ty
+        && old.unsafety == new.unsafety
+        && old.defaultness == new.defaultness
+}
+
+/// Walks the items of two inherent `impl` blocks with the same header, like `added_items`. A
+/// new method or a new associated constant is additive, unless the method name is the name of
+/// a method of a common standard trait, because an inherent method hides the trait method in
+/// every caller.
+fn added_methods(
+    old: &syn::ItemImpl,
+    new: &syn::ItemImpl,
+    added: &mut Vec<String>,
+) -> Result<(), ()> {
+    let name = describe_type(&new.self_ty);
+    let mut i = 0;
+    let mut j = 0;
+    while j < new.items.len() {
+        if i < old.items.len() && old.items[i] == new.items[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        match &new.items[j] {
+            ImplItem::Fn(method) if !hides_a_trait_method(&method.sig) => {
+                added.push(format!("method {name}::{}", method.sig.ident));
+            }
+            ImplItem::Const(constant) => {
+                added.push(format!("associated const {name}::{}", constant.ident));
+            }
+            _ => return Err(()),
+        }
+        j += 1;
+    }
+    if i < old.items.len() {
+        return Err(());
+    }
+    Ok(())
+}
+
+/// The method names of the standard traits that a dependent calls on a value of any type. An
+/// inherent method with one of these names takes the call from the trait method.
+const TRAIT_METHOD_NAMES: &[&str] = &[
+    "add",
+    "as_mut",
+    "as_ref",
+    "borrow",
+    "borrow_mut",
+    "clamp",
+    "clone",
+    "clone_from",
+    "cmp",
+    "default",
+    "deref",
+    "deref_mut",
+    "deserialize",
+    "div",
+    "drop",
+    "eq",
+    "extend",
+    "flush",
+    "fmt",
+    "from",
+    "from_iter",
+    "from_str",
+    "ge",
+    "gt",
+    "hash",
+    "index",
+    "index_mut",
+    "into",
+    "into_iter",
+    "le",
+    "lt",
+    "max",
+    "min",
+    "mul",
+    "ne",
+    "neg",
+    "next",
+    "not",
+    "partial_cmp",
+    "poll",
+    "product",
+    "read",
+    "rem",
+    "serialize",
+    "source",
+    "sub",
+    "sum",
+    "to_owned",
+    "to_string",
+    "try_from",
+    "try_into",
+    "write",
+    "write_fmt",
+    "write_str",
+];
+
+fn hides_a_trait_method(sig: &Signature) -> bool {
+    TRAIT_METHOD_NAMES.contains(&sig.ident.to_string().as_str())
 }
 
 /// Separates the private, unconditional `use` declarations from the other items.
@@ -585,12 +786,96 @@ fn trait_item_attrs_mut(item: &mut syn::TraitItem) -> Option<&mut Vec<Attribute>
 
 #[cfg(test)]
 mod tests {
-    use super::same_interface;
+    use super::{interface_change, same_interface, InterfaceChange};
 
     fn gate(old: &str, new: &str) -> bool {
         let old = syn::parse_file(old).expect("old source parses");
         let new = syn::parse_file(new).expect("new source parses");
         same_interface(&old, &new)
+    }
+
+    /// `true` when the gate reports an additive change.
+    fn additive(old: &str, new: &str) -> bool {
+        let old = syn::parse_file(old).expect("old source parses");
+        let new = syn::parse_file(new).expect("new source parses");
+        matches!(interface_change(&old, &new), InterfaceChange::Additive(_))
+    }
+
+    #[test]
+    fn new_fn_type_and_const_are_additive() {
+        assert!(additive("pub fn f() {}", "pub fn f() {} pub fn g() -> u32 { 1 }"));
+        assert!(additive("pub fn f() {}", "pub struct S; pub fn f() {}"));
+        assert!(additive("pub fn f() {}", "pub fn f() {} pub const N: u32 = 1;"));
+        assert!(additive("pub fn f() {}", "pub fn f() {} pub fn g<T>() -> T { todo!() }"));
+    }
+
+    #[test]
+    fn new_inherent_method_is_additive() {
+        assert!(additive(
+            "pub struct S; impl S { pub fn a(&self) {} }",
+            "pub struct S; impl S { pub fn a(&self) {} pub fn b(&self) {} }",
+        ));
+        assert!(additive(
+            "pub struct S; impl S { pub fn a(&self) {} }",
+            "pub struct S; impl S { pub const N: u32 = 1; pub fn a(&self) {} }",
+        ));
+        assert!(additive(
+            "pub struct S;",
+            "pub struct S; impl S { pub fn a(&self) {} }",
+        ));
+    }
+
+    #[test]
+    fn new_inherent_method_with_a_trait_method_name_is_an_interface_change() {
+        assert!(!additive(
+            "pub struct S; impl S { pub fn a(&self) {} }",
+            "pub struct S; impl S { pub fn a(&self) {} pub fn clone(&self) -> S { S } }",
+        ));
+    }
+
+    #[test]
+    fn new_item_in_inline_module_is_additive() {
+        assert!(additive(
+            "pub mod m { pub fn f() {} }",
+            "pub mod m { pub fn f() {} pub fn g() {} }",
+        ));
+    }
+
+    #[test]
+    fn additive_change_with_a_body_edit_is_additive() {
+        assert!(additive(
+            "pub fn f() -> u32 { 1 }",
+            "pub fn g() -> u32 { 2 } pub fn f() -> u32 { g() }",
+        ));
+    }
+
+    #[test]
+    fn new_trait_impl_macro_module_and_re_export_are_interface_changes() {
+        assert!(!additive("pub fn f() {}", "pub fn f() {} pub trait T {}"));
+        assert!(!additive(
+            "pub struct S;",
+            "pub struct S; impl Default for S { fn default() -> S { S } }",
+        ));
+        assert!(!additive("pub fn f() {}", "pub fn f() {} macro_rules! m { () => {} }"));
+        assert!(!additive("pub fn f() {}", "pub fn f() {} pub mod m {}"));
+        assert!(!additive("pub fn f() {}", "pub fn f() {} pub use std::cmp::max;"));
+        assert!(!gate("pub fn f() {}", "pub fn f() {} pub trait T {}"));
+    }
+
+    #[test]
+    fn new_variant_and_new_field_are_interface_changes() {
+        assert!(!additive("pub enum E { A }", "pub enum E { A, B }"));
+        assert!(!additive("pub struct S { a: u32 }", "pub struct S { a: u32, b: u32 }"));
+    }
+
+    #[test]
+    fn removed_or_changed_item_is_an_interface_change() {
+        assert!(!additive("pub fn f() {} pub fn g() {}", "pub fn f() {}"));
+        assert!(!additive("pub fn f() {}", "pub fn f(x: u32) {}"));
+        assert!(!additive(
+            "pub struct S; impl S { pub fn a(&self) {} }",
+            "pub struct S; impl S { pub fn a(&self, x: u32) {} pub fn b(&self) {} }",
+        ));
     }
 
     #[test]
