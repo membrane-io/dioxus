@@ -606,8 +606,9 @@ impl BuildRequest {
         let patch_objects_dir = self.patch_exe(tip.time_start).with_extension("objects");
         if self.linker_flavor() == LinkerFlavor::WasmLld {
             let t_select = std::time::Instant::now();
-            let index = crate::build::patch::function_hashes(&object_files)?;
+            let index = crate::build::patch::function_hashes(&object_files, &cache.file_hashes)?;
             let seeds = self.changed_functions_since_base(
+                &cache.file_hashes,
                 workspace_rustc_args,
                 modified_crates,
                 out_of_place_crates,
@@ -802,6 +803,13 @@ impl BuildRequest {
         // Keep the tip objects for the next patch. A patch that does not change the tip links
         // them again instead of a new tip compile.
         let link_args = self.keep_tip_objects(&temp_objects, link_args)?;
+        for object in &temp_objects {
+            if let Some(file_name) = object.file_name() {
+                cache
+                    .file_hashes
+                    .file_moved(object, &self.hotpatch_tip_dir().join(file_name));
+            }
+        }
 
         // Now extract linker metadata from the fat binary (assets, plugin data)
         let assets = self
@@ -1553,6 +1561,7 @@ impl BuildRequest {
     /// crate counts as changed.
     fn changed_functions_since_base(
         &self,
+        file_hashes: &crate::build::patch::FileHashCache,
         args: &WorkspaceRustcArgs,
         modified_crates: &HashSet<String>,
         out_of_place_crates: &HashSet<String>,
@@ -1609,7 +1618,7 @@ impl BuildRequest {
                 .ok()
             };
             let old: Vec<PathBuf> = old.into_iter().filter(|path| path.exists()).collect();
-            let old = crate::build::patch::function_hashes(&old)?;
+            let old = crate::build::patch::function_hashes(&old, file_hashes)?;
             let changed = changed(&old, index, &HashSet::from([source]));
             tracing::debug!(
                 "{} functions of {crate_name} differ from the base",
@@ -1625,7 +1634,7 @@ impl BuildRequest {
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "o"))
             .collect();
-        let old = crate::build::patch::function_hashes(&base_tip)?;
+        let old = crate::build::patch::function_hashes(&base_tip, file_hashes)?;
         let changed = changed(&old, index, &(0..tip_count).collect());
         tracing::debug!(
             "{} functions of the tip differ from the base",

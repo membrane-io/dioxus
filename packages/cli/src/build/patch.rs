@@ -106,6 +106,10 @@ pub struct HotpatchModuleCache {
     /// also when an edit took the code back to the base.
     pub patched_functions: RwLock<HashSet<String>>,
 
+    /// (wasm) The function hashes of the link inputs and of the base files, see
+    /// `function_hashes`. A fat build makes a new cache, so the entries live for one fat build.
+    pub file_hashes: FileHashCache,
+
     /// (wasm) Per-build identity read from the base's exported `__subsecond_base_id` global, copied
     /// into every `JumpTable` so the runtime can reject patches built against a different base.
     /// `None` if the base doesn't carry the global (older base, or wasm-bindgen dropped it).
@@ -1703,33 +1707,130 @@ pub struct ObjectIndex {
     pub objects: Vec<PatchObject>,
 }
 
+/// The object index of each link input that an earlier call of `function_hashes` hashed, by
+/// path. The size and the modification time of the file must not change, else the entry is
+/// stale. The base files and the rlibs of the crates that did not replay stay the same for
+/// the life of a fat build, so a patch hashes only the files that its compile wrote.
+#[derive(Default)]
+pub struct FileHashCache {
+    files: std::sync::Mutex<HashMap<PathBuf, CachedFileHashes>>,
+}
+
+struct CachedFileHashes {
+    len: u64,
+    modified: std::time::SystemTime,
+    /// The index of this file alone. Each `PatchObject::source` is 0.
+    index: Arc<ObjectIndex>,
+}
+
+impl FileHashCache {
+    /// The index of the file at `path`, from the cache when the file did not change. Returns
+    /// true as the second value when the function hashed the file.
+    fn file_index(&self, path: &Path) -> anyhow::Result<(Arc<ObjectIndex>, bool)> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("Could not read the metadata of {}", path.display()))?;
+        let modified = metadata.modified()?;
+        let mut files = self.files.lock().unwrap();
+        if let Some(cached) = files.get(path) {
+            if cached.len == metadata.len() && cached.modified == modified {
+                return Ok((cached.index.clone(), false));
+            }
+        }
+        let index = Arc::new(hash_file_functions(path)?);
+        files.insert(
+            path.to_path_buf(),
+            CachedFileHashes {
+                len: metadata.len(),
+                modified,
+                index: index.clone(),
+            },
+        );
+        Ok((index, true))
+    }
+
+    /// Keep the entry of a file that dx moved from `from` to `to`. A move keeps the size and
+    /// the modification time, so the entry stays valid.
+    pub fn file_moved(&self, from: &Path, to: &Path) {
+        let mut files = self.files.lock().unwrap();
+        if let Some(cached) = files.remove(from) {
+            files.insert(to.to_path_buf(), cached);
+        }
+    }
+
+    /// Remove the entries of the files that no longer exist, such as the tip objects of an
+    /// earlier tip compile. Such a file cannot come back with the same content.
+    fn remove_missing(&self) {
+        self.files.lock().unwrap().retain(|path, _| path.exists());
+    }
+}
+
 /// The canonical hash of every function that the wasm objects in `paths` define, by symbol
 /// name. A path is an rlib archive or a single object file.
 ///
 /// The hash covers the code of the function with every relocation site set to zero, and the
 /// relocations of that code as (offset, type, target name, addend), so that two compiles of the
 /// same source give the same hash when the object around the function changed.
-pub fn function_hashes(paths: &[PathBuf]) -> anyhow::Result<ObjectIndex> {
+///
+/// The function hashes only the files that `cache` does not hold, and takes the other files
+/// from `cache`.
+pub fn function_hashes(paths: &[PathBuf], cache: &FileHashCache) -> anyhow::Result<ObjectIndex> {
+    let started = std::time::Instant::now();
     let mut index = ObjectIndex::default();
+    let mut hashed = 0;
     for (source, path) in paths.iter().enumerate() {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
-        match object::read::archive::ArchiveFile::parse(&*bytes) {
-            Ok(archive) => {
-                for member in archive.members() {
-                    let member = member?;
-                    let (offset, size) = member.file_range();
-                    let range = offset as usize..(offset + size) as usize;
-                    let data = member.data(&*bytes)?;
-                    if data.starts_with(b"\0asm") {
-                        hash_object_functions(data, source, Some(range), &mut index)
-                            .with_context(|| format!("In a member of {}", path.display()))?;
-                    }
+        let (file, miss) = cache.file_index(path)?;
+        hashed += usize::from(miss);
+        let offset = index.objects.len();
+        index
+            .objects
+            .extend(file.objects.iter().map(|object| PatchObject {
+                source,
+                ..object.clone()
+            }));
+        index
+            .functions
+            .extend(file.functions.iter().map(|(name, function)| {
+                (
+                    name.clone(),
+                    FunctionOrigin {
+                        hash: function.hash,
+                        object: function.object + offset,
+                    },
+                )
+            }));
+    }
+    if hashed > 0 {
+        cache.remove_missing();
+    }
+    tracing::debug!(
+        "Hashed the functions of {hashed} of {} files, the cache held the others, in {:?}",
+        paths.len(),
+        started.elapsed()
+    );
+    Ok(index)
+}
+
+/// The index of the functions and the objects of one rlib or object file. Each
+/// `PatchObject::source` is 0.
+fn hash_file_functions(path: &Path) -> anyhow::Result<ObjectIndex> {
+    let mut index = ObjectIndex::default();
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
+    match object::read::archive::ArchiveFile::parse(&*bytes) {
+        Ok(archive) => {
+            for member in archive.members() {
+                let member = member?;
+                let (offset, size) = member.file_range();
+                let range = offset as usize..(offset + size) as usize;
+                let data = member.data(&*bytes)?;
+                if data.starts_with(b"\0asm") {
+                    hash_object_functions(data, 0, Some(range), &mut index)
+                        .with_context(|| format!("In a member of {}", path.display()))?;
                 }
             }
-            Err(_) => hash_object_functions(&bytes, source, None, &mut index)
-                .with_context(|| format!("In {}", path.display()))?,
         }
+        Err(_) => hash_object_functions(&bytes, 0, None, &mut index)
+            .with_context(|| format!("In {}", path.display()))?,
     }
     Ok(index)
 }
