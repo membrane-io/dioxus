@@ -14,6 +14,18 @@
 //! unknown attribute can be a proc macro, and a nested `impl` block is visible to trait
 //! resolution in every crate.
 //!
+//! A private function whose body the gate keeps can still be local to its crate. rustc
+//! instantiates a generic function, and exports the body of an `#[inline]` or `async` function,
+//! only for the code that calls it. When every caller of a private function is an opaque body,
+//! no dependent compiles its body. The gate finds these functions in each file: the function
+//! has no visibility modifier, its module has no child module in another file, and no kept part
+//! of the file names it. The search repeats for the kept functions that a kept part names,
+//! because a dependent compiles their bodies too. The gate then treats the body as opaque. The
+//! search compares names only, so a method or a function in another scope with the same name
+//! also counts as a use. A module in another file sees the private items of its parent
+//! modules. When the caller gives the names of the kept parts of those files, see
+//! `names_in_child_modules`, the rule also applies to the top level of a file with such modules.
+//!
 //! A private `use` declaration at the top of the file is not an interface by itself. The gate
 //! compares the names that the declarations bind. A binding that changes only matters when the
 //! kept part of the file uses that name. A `pub use`, a glob import and a `use` under a `cfg`
@@ -62,10 +74,27 @@ pub fn same_interface(old: &syn::File, new: &syn::File) -> bool {
 
 /// Compares the interface of `old` and `new`.
 pub fn interface_change(old: &syn::File, new: &syn::File) -> InterfaceChange {
+    interface_change_in(old, new, None)
+}
+
+/// Compares the interface of `old` and `new`. `child_names` holds the names in the kept parts of
+/// the modules in other files that the file declares, from `names_in_child_modules`.
+pub fn interface_change_in(
+    old: &syn::File,
+    new: &syn::File,
+    child_names: Option<&HashSet<String>>,
+) -> InterfaceChange {
     let mut old = old.clone();
     let mut new = new.clone();
     Stripper.visit_file_mut(&mut old);
     Stripper.visit_file_mut(&mut new);
+    let local: HashSet<String> = local_kept_functions(&old.items, child_names)
+        .intersection(&local_kept_functions(&new.items, child_names))
+        .cloned()
+        .collect();
+    let root_local = child_names.is_some();
+    strip_local_kept_functions(&mut old.items, &local, root_local);
+    strip_local_kept_functions(&mut new.items, &local, root_local);
     if old == new {
         return InterfaceChange::Same;
     }
@@ -176,8 +205,15 @@ fn additive_item(item: &Item) -> Option<String> {
         | Item::Static(_) => Some(describe_item(item)),
         Item::Impl(block) if block.trait_.is_none() => {
             let mut added = Vec::new();
-            added_methods(&syn::ItemImpl { items: Vec::new(), ..block.clone() }, block, &mut added)
-                .ok()?;
+            added_methods(
+                &syn::ItemImpl {
+                    items: Vec::new(),
+                    ..block.clone()
+                },
+                block,
+                &mut added,
+            )
+            .ok()?;
             Some(describe_item(item))
         }
         _ => None,
@@ -400,6 +436,236 @@ impl IdentCollector<'_> {
             }
         }
     }
+}
+
+/// A private function that `local_kept_functions` can treat as local: the gate keeps its body
+/// only because it is generic, a method of a generic impl, `async`, `#[inline]` or has
+/// `impl Trait` in its signature. A `const fn` can run in the type of a public item, and an
+/// unknown attribute or an item in the body can reach other crates, so they do not qualify.
+fn is_local_candidate(
+    attrs: &[Attribute],
+    vis: &Visibility,
+    sig: &Signature,
+    impl_generics: Option<&Generics>,
+    body: &Block,
+) -> bool {
+    matches!(vis, Visibility::Inherited)
+        && sig.constness.is_none()
+        && !body_has_visible_item(body)
+        && attrs
+            .iter()
+            .all(|attr| is_opaque_attribute(attr) || attr.path().is_ident("inline"))
+        && keep_reason(attrs, sig, impl_generics, body).is_some()
+}
+
+/// True when `items` or an inline module in them declares a module in another file. The
+/// private items of `items` are visible in that file.
+fn has_module_in_other_file(items: &[Item]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Mod(module) => match &module.content {
+            None => true,
+            Some((_, items)) => has_module_in_other_file(items),
+        },
+        _ => false,
+    })
+}
+
+/// The names of the private kept functions of `items` that no dependent can compile. See the
+/// module documentation. The caller runs the `Stripper` on `items` first, so the bodies of the
+/// opaque functions are empty and do not count as a use.
+/// `child_names` holds the names in the modules in other files that the top level of `items`
+/// declares. Without it, the top level of a file with such modules has no local function.
+fn local_kept_functions(items: &[Item], child_names: Option<&HashSet<String>>) -> HashSet<String> {
+    fn scan(
+        items: &[Item],
+        root_local: bool,
+        candidates: &mut Vec<(String, HashSet<String>)>,
+        used: &mut HashSet<String>,
+    ) {
+        let local_module = root_local || !has_module_in_other_file(items);
+        let body_names = |body: &Block| {
+            let mut names = HashSet::new();
+            IdentCollector(&mut names).visit_block(body);
+            names
+        };
+        for item in items {
+            match item {
+                Item::Fn(function)
+                    if local_module
+                        && is_local_candidate(
+                            &function.attrs,
+                            &function.vis,
+                            &function.sig,
+                            None,
+                            &function.block,
+                        ) =>
+                {
+                    candidates.push((function.sig.ident.to_string(), body_names(&function.block)));
+                }
+                Item::Impl(block) if block.trait_.is_none() => {
+                    let mut collector = IdentCollector(used);
+                    for attr in &block.attrs {
+                        collector.visit_attribute(attr);
+                    }
+                    collector.visit_generics(&block.generics);
+                    collector.visit_type(&block.self_ty);
+                    for impl_item in &block.items {
+                        match impl_item {
+                            ImplItem::Fn(method)
+                                if local_module
+                                    && is_local_candidate(
+                                        &method.attrs,
+                                        &method.vis,
+                                        &method.sig,
+                                        Some(&block.generics),
+                                        &method.block,
+                                    ) =>
+                            {
+                                candidates.push((
+                                    method.sig.ident.to_string(),
+                                    body_names(&method.block),
+                                ));
+                            }
+                            other => IdentCollector(used).visit_impl_item(other),
+                        }
+                    }
+                }
+                Item::Mod(module) if module.content.is_some() => {
+                    let mut collector = IdentCollector(used);
+                    for attr in &module.attrs {
+                        collector.visit_attribute(attr);
+                    }
+                    let (_, items) = module.content.as_ref().unwrap();
+                    scan(items, false, candidates, used);
+                }
+                other => IdentCollector(used).visit_item(other),
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut used = child_names.cloned().unwrap_or_default();
+    scan(items, child_names.is_some(), &mut candidates, &mut used);
+    // A kept function that a kept part names is compiled by a dependent too, so the names in
+    // its body count as a use. Repeat until no new function is found.
+    let mut exposed: HashSet<String> = HashSet::new();
+    loop {
+        let mut found = false;
+        for (name, _) in &candidates {
+            if used.contains(name) && exposed.insert(name.clone()) {
+                found = true;
+            }
+        }
+        if !found {
+            break;
+        }
+        for (name, names) in &candidates {
+            if exposed.contains(name) {
+                used.extend(names.iter().cloned());
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| !exposed.contains(name))
+        .collect()
+}
+
+/// Empty the body of each private kept function in `items` whose name is in `names`. The
+/// selection repeats the one of `local_kept_functions`.
+fn strip_local_kept_functions(items: &mut [Item], names: &HashSet<String>, root_local: bool) {
+    if names.is_empty() {
+        return;
+    }
+    let local_module = root_local || !has_module_in_other_file(items);
+    for item in items {
+        match item {
+            Item::Fn(function)
+                if local_module
+                    && names.contains(&function.sig.ident.to_string())
+                    && is_local_candidate(
+                        &function.attrs,
+                        &function.vis,
+                        &function.sig,
+                        None,
+                        &function.block,
+                    ) =>
+            {
+                function.block = Box::new(empty_block());
+            }
+            Item::Impl(block) if block.trait_.is_none() && local_module => {
+                let generics = block.generics.clone();
+                for impl_item in &mut block.items {
+                    if let ImplItem::Fn(method) = impl_item {
+                        if names.contains(&method.sig.ident.to_string())
+                            && is_local_candidate(
+                                &method.attrs,
+                                &method.vis,
+                                &method.sig,
+                                Some(&generics),
+                                &method.block,
+                            )
+                        {
+                            method.block = empty_block();
+                        }
+                    }
+                }
+            }
+            Item::Mod(module) => {
+                if let Some((_, items)) = &mut module.content {
+                    strip_local_kept_functions(items, names, false);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The names in the kept parts of the modules in other files that `file` declares, and of their
+/// own child modules, read from the disk. `path` is the path of `file`. The result is `None` when
+/// a module path is not certain: a `#[path]` attribute, a module in another file inside an inline
+/// module, or a file that dx cannot read or parse.
+pub fn names_in_child_modules(path: &std::path::Path, file: &syn::File) -> Option<HashSet<String>> {
+    // The directory of the child modules: the directory of `lib.rs`, `main.rs` and `mod.rs`,
+    // else a directory with the name of the file.
+    let dir = match path.file_stem()?.to_str()? {
+        "lib" | "main" | "mod" => path.parent()?.to_path_buf(),
+        stem => path.parent()?.join(stem),
+    };
+    let mut names = HashSet::new();
+    for item in &file.items {
+        match item {
+            Item::Mod(module) if module.content.is_none() => {
+                if module.attrs.iter().any(|attr| attr.path().is_ident("path")) {
+                    return None;
+                }
+                if is_cfg_test(Some(&module.attrs)) {
+                    continue;
+                }
+                let name = module.ident.to_string();
+                let child = [
+                    dir.join(format!("{name}.rs")),
+                    dir.join(&name).join("mod.rs"),
+                ]
+                .into_iter()
+                .find(|candidate| candidate.exists())?;
+                let mut child_file =
+                    syn::parse_file(&std::fs::read_to_string(&child).ok()?).ok()?;
+                Stripper.visit_file_mut(&mut child_file);
+                IdentCollector(&mut names).visit_file(&child_file);
+                names.extend(names_in_child_modules(&child, &child_file)?);
+            }
+            Item::Mod(module) => {
+                let (_, items) = module.content.as_ref()?;
+                if has_module_in_other_file(items) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(names)
 }
 
 /// Describes the first difference between two versions of one item. For an `impl` block or a
@@ -669,15 +935,34 @@ fn signature_has_impl_trait(sig: &Signature) -> bool {
 }
 
 /// An `impl` block inside a body is visible to trait resolution in every crate. A macro item
-/// inside a body can expand to one.
+/// inside a body can expand to one, and so can a statement macro with braces. A `macro_rules!`
+/// definition cannot, and only its name is visible outside the body, when it has
+/// `#[macro_export]`.
 fn body_has_visible_item(body: &Block) -> bool {
     struct Finder(bool);
     impl<'ast> Visit<'ast> for Finder {
         fn visit_item(&mut self, item: &'ast Item) {
-            if matches!(item, Item::Impl(_) | Item::Macro(_)) {
+            let visible = match item {
+                Item::Impl(_) => true,
+                Item::Macro(item) => {
+                    !item.mac.path.is_ident("macro_rules")
+                        || item
+                            .attrs
+                            .iter()
+                            .any(|attr| attr.path().is_ident("macro_export"))
+                }
+                _ => false,
+            };
+            if visible {
                 self.0 = true;
             }
             syn::visit::visit_item(self, item);
+        }
+        fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+            if matches!(stmt.mac.delimiter, syn::MacroDelimiter::Brace(_)) {
+                self.0 = true;
+            }
+            syn::visit::visit_stmt_macro(self, stmt);
         }
     }
     let mut finder = Finder(false);
@@ -786,7 +1071,10 @@ fn trait_item_attrs_mut(item: &mut syn::TraitItem) -> Option<&mut Vec<Attribute>
 
 #[cfg(test)]
 mod tests {
-    use super::{interface_change, same_interface, InterfaceChange};
+    use super::{
+        InterfaceChange, interface_change, interface_change_in, names_in_child_modules,
+        same_interface,
+    };
 
     fn gate(old: &str, new: &str) -> bool {
         let old = syn::parse_file(old).expect("old source parses");
@@ -803,10 +1091,19 @@ mod tests {
 
     #[test]
     fn new_fn_type_and_const_are_additive() {
-        assert!(additive("pub fn f() {}", "pub fn f() {} pub fn g() -> u32 { 1 }"));
+        assert!(additive(
+            "pub fn f() {}",
+            "pub fn f() {} pub fn g() -> u32 { 1 }"
+        ));
         assert!(additive("pub fn f() {}", "pub struct S; pub fn f() {}"));
-        assert!(additive("pub fn f() {}", "pub fn f() {} pub const N: u32 = 1;"));
-        assert!(additive("pub fn f() {}", "pub fn f() {} pub fn g<T>() -> T { todo!() }"));
+        assert!(additive(
+            "pub fn f() {}",
+            "pub fn f() {} pub const N: u32 = 1;"
+        ));
+        assert!(additive(
+            "pub fn f() {}",
+            "pub fn f() {} pub fn g<T>() -> T { todo!() }"
+        ));
     }
 
     #[test]
@@ -856,16 +1153,25 @@ mod tests {
             "pub struct S;",
             "pub struct S; impl Default for S { fn default() -> S { S } }",
         ));
-        assert!(!additive("pub fn f() {}", "pub fn f() {} macro_rules! m { () => {} }"));
+        assert!(!additive(
+            "pub fn f() {}",
+            "pub fn f() {} macro_rules! m { () => {} }"
+        ));
         assert!(!additive("pub fn f() {}", "pub fn f() {} pub mod m {}"));
-        assert!(!additive("pub fn f() {}", "pub fn f() {} pub use std::cmp::max;"));
+        assert!(!additive(
+            "pub fn f() {}",
+            "pub fn f() {} pub use std::cmp::max;"
+        ));
         assert!(!gate("pub fn f() {}", "pub fn f() {} pub trait T {}"));
     }
 
     #[test]
     fn new_variant_and_new_field_are_interface_changes() {
         assert!(!additive("pub enum E { A }", "pub enum E { A, B }"));
-        assert!(!additive("pub struct S { a: u32 }", "pub struct S { a: u32, b: u32 }"));
+        assert!(!additive(
+            "pub struct S { a: u32 }",
+            "pub struct S { a: u32, b: u32 }"
+        ));
     }
 
     #[test]
@@ -921,8 +1227,8 @@ mod tests {
     #[test]
     fn generic_impl_method_body_is_an_interface() {
         assert!(!gate(
-            "struct S<T>(T); impl<T> S<T> { fn f(&self) -> u32 { 1 } }",
-            "struct S<T>(T); impl<T> S<T> { fn f(&self) -> u32 { 2 } }",
+            "pub struct S<T>(T); impl<T> S<T> { pub fn f(&self) -> u32 { 1 } }",
+            "pub struct S<T>(T); impl<T> S<T> { pub fn f(&self) -> u32 { 2 } }",
         ));
     }
 
@@ -955,6 +1261,146 @@ mod tests {
         assert!(!gate(
             "pub fn f(x: impl Into<u32>) -> u32 { x.into() }",
             "pub fn f(x: impl Into<u32>) -> u32 { x.into() + 1 }",
+        ));
+    }
+
+    #[test]
+    fn private_kept_fn_with_only_opaque_callers_is_body_only() {
+        let file = |n: u32| {
+            format!(
+                "fn helper(ui: &mut u32, add: impl FnOnce(&mut u32)) {{ *ui += {n}; add(ui) }}
+                 fn generic<T: Default>() -> T {{ let _ = {n}; T::default() }}
+                 async fn fetch() -> u32 {{ {n} }}
+                 pub fn show(ui: &mut u32) {{ helper(ui, |_| {{}}); let _: u32 = generic(); }}
+                 pub struct S;
+                 impl S {{
+                     fn private_method(&self, f: impl Fn() -> u32) -> u32 {{ f() + {n} }}
+                     pub fn run(&self) -> u32 {{ self.private_method(|| 1) }}
+                 }}"
+            )
+        };
+        assert!(gate(&file(1), &file(2)));
+    }
+
+    #[test]
+    fn private_kept_fn_that_a_kept_body_calls_is_an_interface() {
+        // A public generic function calls the helper, so a dependent compiles the helper.
+        assert!(!gate(
+            "fn helper(x: impl Into<u32>) -> u32 { x.into() }
+             pub fn show<T: Into<u32>>(x: T) -> u32 { helper(x) }",
+            "fn helper(x: impl Into<u32>) -> u32 { x.into() + 1 }
+             pub fn show<T: Into<u32>>(x: T) -> u32 { helper(x) }",
+        ));
+        // The same through a second private generic function.
+        assert!(!gate(
+            "fn inner<T>(_: T) -> u32 { 1 }
+             fn outer<T>(x: T) -> u32 { inner(x) }
+             #[inline] pub fn show() -> u32 { outer(0u8) }",
+            "fn inner<T>(_: T) -> u32 { 2 }
+             fn outer<T>(x: T) -> u32 { inner(x) }
+             #[inline] pub fn show() -> u32 { outer(0u8) }",
+        ));
+        // A generic method of a trait impl calls the helper.
+        assert!(!gate(
+            "fn helper<T>(_: T) -> u32 { 1 }
+             pub struct W<T>(T);
+             impl<T: Clone> Clone for W<T> { fn clone(&self) -> Self { helper(0u8); W(self.0.clone()) } }",
+            "fn helper<T>(_: T) -> u32 { 2 }
+             pub struct W<T>(T);
+             impl<T: Clone> Clone for W<T> { fn clone(&self) -> Self { helper(0u8); W(self.0.clone()) } }",
+        ));
+    }
+
+    #[test]
+    fn private_kept_fn_visible_to_another_file_is_an_interface() {
+        // A child module in another file can call the helper from a public generic function.
+        assert!(!gate(
+            "mod child; fn helper<T>(_: T) -> u32 { 1 }",
+            "mod child; fn helper<T>(_: T) -> u32 { 2 }",
+        ));
+        // `pub(crate)` makes the helper visible to the other files of the crate.
+        assert!(!gate(
+            "pub(crate) fn helper<T>(_: T) -> u32 { 1 }",
+            "pub(crate) fn helper<T>(_: T) -> u32 { 2 }",
+        ));
+        // A child module in another file sees only the items of its own parent modules, so a
+        // helper in a sibling inline module stays local.
+        assert!(gate(
+            "mod other; mod local { fn helper<T>(_: T) -> u32 { 1 } pub fn f() -> u32 { helper(0u8) } }",
+            "mod other; mod local { fn helper<T>(_: T) -> u32 { 2 } pub fn f() -> u32 { helper(0u8) } }",
+        ));
+    }
+
+    /// The gate result for `old` and `new` at `dir/lib.rs`, with the names of its child modules.
+    fn gate_with_children(dir: &std::path::Path, old: &str, new: &str) -> bool {
+        let old = syn::parse_file(old).expect("old source parses");
+        let new = syn::parse_file(new).expect("new source parses");
+        let names = names_in_child_modules(&dir.join("lib.rs"), &new);
+        interface_change_in(&old, &new, names.as_ref()) == InterfaceChange::Same
+    }
+
+    #[test]
+    fn private_kept_fn_with_child_module_files_uses_their_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("quiet.rs"),
+            "pub fn g() -> u32 { super::helper(0u8) }",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("loud")).unwrap();
+        std::fs::write(dir.path().join("loud/mod.rs"), "mod inner;").unwrap();
+        std::fs::write(
+            dir.path().join("loud/inner.rs"),
+            "pub fn g<T>(_: T) -> u32 { super::super::shown(0u8) }",
+        )
+        .unwrap();
+        // The opaque body of `quiet::g` calls `helper`, so `helper` stays local.
+        assert!(gate_with_children(
+            dir.path(),
+            "mod quiet; mod loud; fn helper<T>(_: T) -> u32 { 1 }",
+            "mod quiet; mod loud; fn helper<T>(_: T) -> u32 { 2 }",
+        ));
+        // A generic function in a grandchild module calls `shown`, so its body is an interface.
+        assert!(!gate_with_children(
+            dir.path(),
+            "mod quiet; mod loud; fn shown<T>(_: T) -> u32 { 1 }",
+            "mod quiet; mod loud; fn shown<T>(_: T) -> u32 { 2 }",
+        ));
+        // dx cannot find the file of `missing`, so every body in the file stays an interface.
+        assert!(!gate_with_children(
+            dir.path(),
+            "mod missing; fn helper<T>(_: T) -> u32 { 1 }",
+            "mod missing; fn helper<T>(_: T) -> u32 { 2 }",
+        ));
+    }
+
+    #[test]
+    fn private_kept_fn_with_a_local_macro_rules_is_body_only() {
+        assert!(gate(
+            "fn helper<T>(_: T) -> u32 { macro_rules! one { () => { 1 } } one!() }",
+            "fn helper<T>(_: T) -> u32 { macro_rules! one { () => { 2 } } one!() }",
+        ));
+        // An exported macro is visible to the dependents.
+        assert!(!gate(
+            "fn helper<T>(_: T) -> u32 { #[macro_export] macro_rules! one { () => { 1 } } 1 }",
+            "fn helper<T>(_: T) -> u32 { #[macro_export] macro_rules! one { () => { 2 } } 1 }",
+        ));
+        // Another item macro can expand to an `impl` block.
+        assert!(!gate(
+            "fn helper<T>(_: T) -> u32 { make_impl! { A } 1 }",
+            "fn helper<T>(_: T) -> u32 { make_impl! { A } 2 }",
+        ));
+    }
+
+    #[test]
+    fn private_const_fn_and_unknown_attribute_keep_the_body() {
+        assert!(!gate(
+            "const fn helper() -> u32 { 1 } pub fn f() -> u32 { helper() }",
+            "const fn helper() -> u32 { 2 } pub fn f() -> u32 { helper() }",
+        ));
+        assert!(!gate(
+            "#[some_macro] fn helper<T>(_: T) -> u32 { 1 }",
+            "#[some_macro] fn helper<T>(_: T) -> u32 { 2 }",
         ));
     }
 

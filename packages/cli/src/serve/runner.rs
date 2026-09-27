@@ -543,7 +543,11 @@ impl AppServer {
                 // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
                 cached_file.most_recent = Some(new_contents);
 
-                match crate::build::interface_change(&old_file, &new_file) {
+                // A module in another file can call a private function of this file. The gate
+                // needs the names in those files to treat such a function as local.
+                let child_names = crate::build::names_in_child_modules(path, &new_file);
+                match crate::build::interface_change_in(&old_file, &new_file, child_names.as_ref())
+                {
                     InterfaceChange::Same => {
                         body_only_files.insert(path.clone());
                     }
