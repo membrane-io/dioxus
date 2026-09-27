@@ -985,11 +985,9 @@ impl AppServer {
     pub(crate) fn commit_rebuilt_artifact(&mut self, id: BuildId) {
         if id == BuildId::PRIMARY {
             self.client.patches.clear();
-            self.client.previous_patch_ifuncs = None;
             self.clear_hot_reload_changes();
         } else if let Some(server) = self.server.as_mut() {
             server.patches.clear();
-            server.previous_patch_ifuncs = None;
         }
     }
 
@@ -1083,28 +1081,43 @@ impl AppServer {
     }
 
     /// Get any hot reload changes that have been applied since the last full rebuild
-    pub(crate) fn applied_hot_reload_changes(&mut self, build: BuildId) -> HotReloadMsg {
-        let mut msg = self.applied_client_hot_reload_message.clone();
-
+    /// The messages that bring a new client to the state of the running app. The first message
+    /// holds the template and asset changes. A patch that builds on the last patch needs the
+    /// earlier patches too, see `JumpTable::builds_on`. So the messages hold each patch from the
+    /// last self-contained patch to the newest patch, in order, one patch in each message.
+    pub(crate) fn applied_hot_reload_changes(&mut self, build: BuildId) -> Vec<HotReloadMsg> {
+        let mut first = self.applied_client_hot_reload_message.clone();
+        let patches = if build == BuildId::PRIMARY {
+            &self.client.patches
+        } else if let Some(server) = self.server.as_ref() {
+            &server.patches
+        } else {
+            return vec![first];
+        };
+        let start = patches
+            .iter()
+            .rposition(|patch| patch.builds_on.is_none())
+            .unwrap_or(0);
+        let mut chain: Vec<subsecond_types::JumpTable> = patches[start..].to_vec();
         if build == BuildId::PRIMARY {
-            msg.jump_table = self.client.patches.last().cloned();
-            msg.for_build_id = Some(BuildId::PRIMARY.0 as _);
-            if let Some(lib) = msg.jump_table.as_mut() {
-                lib.lib = PathBuf::from("/").join(lib.lib.clone());
-                if let Some(sidecar) = lib.dwarf_sidecar.as_mut() {
+            for table in &mut chain {
+                table.lib = PathBuf::from("/").join(table.lib.clone());
+                if let Some(sidecar) = table.dwarf_sidecar.as_mut() {
                     *sidecar = PathBuf::from("/").join(sidecar.clone());
                 }
             }
         }
-
-        if build == BuildId::SECONDARY {
-            if let Some(server) = self.server.as_mut() {
-                msg.jump_table = server.patches.last().cloned();
-                msg.for_build_id = Some(BuildId::SECONDARY.0 as _);
-            }
-        }
-
-        msg
+        let for_build_id = Some(build.0 as _);
+        let mut chain = chain.into_iter();
+        first.jump_table = chain.next();
+        first.for_build_id = for_build_id;
+        let mut messages = vec![first];
+        messages.extend(chain.map(|table| HotReloadMsg {
+            jump_table: Some(table),
+            for_build_id,
+            ..Default::default()
+        }));
+        messages
     }
 
     /// Clear the templates and the assets that the runner replays to a new client.

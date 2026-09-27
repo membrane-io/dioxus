@@ -1,10 +1,10 @@
 use anyhow::Context;
 use itertools::Itertools;
 use object::{
+    Endianness, Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
     macho::{self},
     read::File,
     write::{MachOBuildVersion, SectionId, StandardSection, Symbol, SymbolId, SymbolSection},
-    Endianness, Object, ObjectSection, ObjectSymbol, SymbolFlags, SymbolKind, SymbolScope,
 };
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::{
@@ -101,10 +101,9 @@ pub struct HotpatchModuleCache {
     /// (wasm) Whether each function of the base, by wasm function index, has a slot in the table.
     pub in_table: Vec<bool>,
 
-    /// (wasm) The functions that the patches since the fat build defined. The next patch
-    /// defines them again, so that the slots of an earlier patch repoint to the newest code,
-    /// also when an edit took the code back to the base.
-    pub patched_functions: RwLock<HashSet<String>>,
+    /// (wasm) The functions that the patches since the fat build defined, and the table slots
+    /// of those patches. See `LivePatches`.
+    pub live: RwLock<LivePatches>,
 
     /// (wasm) The function hashes of the link inputs and of the base files, see
     /// `function_hashes`. A fat build makes a new cache, so the entries live for one fat build.
@@ -511,7 +510,9 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         ifunc_count: 0,
         dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
-        previous_patch: None,
+        earlier_patches: Vec::new(),
+        builds_on: None,
+        retired: Vec::new(),
         wasm: None,
         base_id: None,
     })
@@ -567,7 +568,9 @@ pub fn create_native_jump_table(
         ifunc_count: 0,
         dwarf_sidecar: None,
         ifunc_repoint: Vec::new(),
-        previous_patch: None,
+        earlier_patches: Vec::new(),
+        builds_on: None,
+        retired: Vec::new(),
         wasm: None,
         base_id: None,
     })
@@ -600,8 +603,8 @@ pub fn create_native_jump_table(
 ///
 /// <https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md>
 /// The functions that a patch put into the shared table: the name and the signature of each
-/// slot of its region. dx keeps this for the last patch of a session, so that the next patch
-/// can repoint the region of the last patch too. See `JumpTable::previous_patch`.
+/// slot of its region. dx keeps this for each patch of a session, so that a later patch can
+/// repoint the region of an earlier patch too. See `JumpTable::earlier_patches`.
 #[derive(Debug, Clone)]
 pub struct PatchIfuncs {
     pub lib: PathBuf,
@@ -609,15 +612,152 @@ pub struct PatchIfuncs {
     pub ifunc_sigs: HashMap<i32, SigVec>,
 }
 
-/// Build the jump table of a wasm patch. Returns the table and, on the fast path, the slots
-/// of the patch for the next jump table.
+/// (wasm) The functions that the patches since the fat build defined, and the table slots of
+/// those patches.
+///
+/// A patch that builds on the last patch defines only the functions that changed since that
+/// patch, and the functions that reach them through direct calls. It calls every other
+/// function of the earlier patches through the base slot of that function, which the runtime
+/// repointed to the last definition. See `HotpatchModuleCache::patch_functions_live`.
+#[derive(Default)]
+pub struct LivePatches {
+    /// Each function that a patch defined, with the facts of its last definition.
+    pub functions: HashMap<String, LiveFunction>,
+    /// The table slots of each patch since the fat build, in the order of the patches.
+    pub regions: Vec<PatchIfuncs>,
+}
+
+/// The last definition of a function in a patch. See `LivePatches`.
+#[derive(Debug, Clone)]
+pub struct LiveFunction {
+    /// The hash of the function in the link input of the patch. `None` when no link input
+    /// held the function, for example a function that the linker made.
+    pub hash: Option<u64>,
+    /// The functions that the definition calls directly, by name. A call to an import counts
+    /// too, because the runtime binds an import to a function at the instantiation.
+    pub callees: Vec<String>,
+    /// True when the base slot of the function holds this definition. The runtime repoints
+    /// the base slot only when the signature did not change.
+    pub base_slot: bool,
+    /// The index of the patch in `LivePatches::regions`.
+    pub region: usize,
+}
+
+/// The functions that a linked patch defines. The link step reads them from the patch, and
+/// the jump table step adds them to `LivePatches`.
+#[derive(Debug, Clone, Default)]
+pub struct PatchDefinitions {
+    /// True when the patch builds on the last patch, see `JumpTable::builds_on`.
+    pub incremental: bool,
+    /// Each function that the patch defines: its hash in the link input, and its direct
+    /// callees.
+    pub functions: HashMap<String, (Option<u64>, Vec<String>)>,
+}
+
+/// The functions of a patch link. See `HotpatchModuleCache::patch_functions`.
+pub struct PatchSelection {
+    /// The number of functions that changed since the last definition.
+    pub seeds: usize,
+    /// Every function that the patch must define.
+    pub wanted: HashSet<String>,
+    /// The functions of `wanted` that have a slot in the base table, sorted.
+    pub roots: Vec<String>,
+}
+
+/// Build the jump table of a wasm patch, and add the functions of the patch to the live state
+/// of the cache. `definitions` holds the functions of the patch, from the link step.
 pub fn create_wasm_jump_table(
     patch: &Path,
     cache: &HotpatchModuleCache,
     keep_names: bool,
     dwarf_sidecar: bool,
-    previous: Option<&PatchIfuncs>,
-) -> Result<(JumpTable, Option<PatchIfuncs>)> {
+    definitions: Option<&PatchDefinitions>,
+) -> Result<JumpTable> {
+    let (mut table, ifuncs) =
+        create_wasm_jump_table_inner(patch, cache, keep_names, dwarf_sidecar)?;
+    let mut live = cache.live.write().unwrap();
+
+    // The pairs of the earlier regions, so that the runtime repoints the slots that the
+    // vtables and the function pointers of the earlier patches use.
+    for region in &live.regions {
+        let mut repoint = Vec::new();
+        for (name, &new_idx) in ifuncs.name_to_ifunc.iter() {
+            let Some(&old_idx) = region.name_to_ifunc.get(name) else {
+                continue;
+            };
+            if region.ifunc_sigs.get(&old_idx) == ifuncs.ifunc_sigs.get(&new_idx) {
+                repoint.push((old_idx as u64, new_idx as u64));
+            }
+        }
+        if !repoint.is_empty() {
+            repoint.sort_unstable();
+            table.earlier_patches.push(subsecond_types::PreviousPatch {
+                lib: region.lib.clone(),
+                repoint,
+            });
+        }
+    }
+
+    let Some(definitions) = definitions else {
+        return Ok(table);
+    };
+    if definitions.incremental {
+        table.builds_on = live.regions.last().map(|region| region.lib.clone());
+    }
+
+    // The functions of the patch are now the last definitions. An earlier patch whose
+    // functions all have a newer definition is old.
+    let region = live.regions.len();
+    let mut functions_before = vec![0usize; region];
+    for function in live.functions.values() {
+        functions_before[function.region] += 1;
+    }
+    let repointed: HashSet<u64> = table.ifunc_repoint.iter().map(|(old, _)| *old).collect();
+    for (name, (hash, callees)) in &definitions.functions {
+        let base_slot = cache
+            .symbol_ifunc_map
+            .get(name)
+            .is_some_and(|idx| repointed.contains(&(*idx as u64)));
+        live.functions.insert(
+            name.clone(),
+            LiveFunction {
+                hash: *hash,
+                callees: callees.clone(),
+                base_slot,
+                region,
+            },
+        );
+    }
+    let mut functions_after = vec![0usize; region];
+    for function in live.functions.values() {
+        if function.region < region {
+            functions_after[function.region] += 1;
+        }
+    }
+    for (index, earlier) in live.regions.iter().enumerate() {
+        if functions_before[index] > 0 && functions_after[index] == 0 {
+            table.retired.push(earlier.lib.clone());
+        }
+    }
+    live.regions.push(ifuncs);
+    tracing::debug!(
+        "Patch regions: {} earlier patches with pairs, builds on {:?}, {} retired, {} live functions",
+        table.earlier_patches.len(),
+        table.builds_on.as_ref().and_then(|lib| lib.file_name()),
+        table.retired.len(),
+        live.functions.len(),
+    );
+    Ok(table)
+}
+
+/// Build the jump table of a wasm patch. Returns the table and the slots of the patch. The
+/// walrus path returns no slots.
+fn create_wasm_jump_table_inner(
+    patch: &Path,
+    cache: &HotpatchModuleCache,
+    keep_names: bool,
+    dwarf_sidecar: bool,
+) -> Result<(JumpTable, PatchIfuncs)> {
     let t_start = std::time::Instant::now();
     let linked = std::fs::read(patch).context("Could not read patch file")?;
 
@@ -649,14 +789,19 @@ pub fn create_wasm_jump_table(
     // function body, so if any are present we have to take the walrus path that re-encodes the code.
     if analysis.needs_body_rewrite {
         tracing::debug!("Patch needs wbg_cast body rewrite; using walrus jump-table path");
+        let ifuncs = PatchIfuncs {
+            lib: patch.to_path_buf(),
+            name_to_ifunc: HashMap::new(),
+            ifunc_sigs: HashMap::new(),
+        };
         return Ok((
             create_wasm_jump_table_walrus(patch, cache, keep_names, sidecar)?,
-            None,
+            ifuncs,
         ));
     }
 
     create_wasm_jump_table_fast(
-        patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names, sidecar, previous,
+        patch, &new_bytes, analysis, cache, t_start, t_parsed, keep_names, sidecar,
     )
 }
 
@@ -749,8 +894,12 @@ fn analyze_patch_wasm(bytes: &[u8]) -> Result<PatchWasmAnalysis> {
                     for sub in rec_group?.into_types() {
                         match sub.composite_type.inner {
                             wasmparser::CompositeInnerType::Func(ft) => {
-                                let params =
-                                    ft.params().iter().copied().map(wasmparser_valtype_sig).collect();
+                                let params = ft
+                                    .params()
+                                    .iter()
+                                    .copied()
+                                    .map(wasmparser_valtype_sig)
+                                    .collect();
                                 let results = ft
                                     .results()
                                     .iter()
@@ -821,7 +970,8 @@ fn analyze_patch_wasm(bytes: &[u8]) -> Result<PatchWasmAnalysis> {
                 }
             }
             Payload::CustomSection(section) if section.name() == "name" => {
-                let reader = wasmparser::NameSectionReader::new(BinaryReader::new(section.data(), 0));
+                let reader =
+                    wasmparser::NameSectionReader::new(BinaryReader::new(section.data(), 0));
                 for subsection in reader {
                     let Ok(wasmparser::Name::Function(map)) = subsection else {
                         continue;
@@ -894,9 +1044,8 @@ fn create_wasm_jump_table_fast(
     t_parsed: std::time::Duration,
     keep_names: bool,
     dwarf_sidecar: Option<PathBuf>,
-    previous: Option<&PatchIfuncs>,
-) -> Result<(JumpTable, Option<PatchIfuncs>)> {
-    use subsecond_types::{PreviousPatch, WasmFixups};
+) -> Result<(JumpTable, PatchIfuncs)> {
+    use subsecond_types::WasmFixups;
 
     let name_to_ifunc_old = &cache.symbol_ifunc_map;
     // Base-derived signatures, precomputed at cache-build time (normalized for cross-parser
@@ -925,7 +1074,23 @@ fn create_wasm_jump_table_fast(
         got_mem.push((name.clone(), offset));
     }
 
+    let live = cache.live.read().unwrap();
     for (name, sig) in &analysis.env_funcs {
+        // A function that an earlier patch defined is in the base slot, which the runtime
+        // repointed to that patch. The export of the base holds the old code, so the slot
+        // replaces the export.
+        if live
+            .functions
+            .get(name)
+            .is_some_and(|function| function.base_slot)
+        {
+            if let Some(&idx) = name_to_ifunc_old.get(name.as_str()) {
+                if old_sigs.get(&idx) == Some(sig) {
+                    env_ifunc.push((name.clone(), idx));
+                    continue;
+                }
+            }
+        }
         // Base-exported (or base-imported) functions are satisfied by the host exports the runtime
         // already copies into `env`; nothing to ship for those.
         if cache.old_exports.contains(name) || cache.old_imports.contains(name) {
@@ -944,6 +1109,7 @@ fn create_wasm_jump_table_fast(
         }
     }
 
+    drop(live);
     let got_mutable = analysis.got_mutable.unwrap_or(true);
     let n_got_func = got_func.len();
     let n_got_mem = got_mem.len();
@@ -976,25 +1142,6 @@ fn create_wasm_jump_table_fast(
         }
     }
 
-    // The same pairs from the region of the previous patch, so that the runtime repoints the
-    // slots that the vtables and the function pointers of the previous patch use. The previous
-    // module then holds no slot of the table, and the browser can free it.
-    let previous_patch = previous.map(|prev| {
-        let mut repoint = Vec::new();
-        for (name, &prev_idx) in prev.name_to_ifunc.iter() {
-            let Some(&new_idx) = analysis.name_to_ifunc.get(name.as_str()) else {
-                continue;
-            };
-            if prev.ifunc_sigs.get(&prev_idx) == analysis.ifunc_sigs.get(&new_idx) {
-                repoint.push((prev_idx as u64, new_idx as u64));
-            }
-        }
-        repoint.sort_unstable();
-        PreviousPatch {
-            lib: prev.lib.clone(),
-            repoint,
-        }
-    });
     let t_analyzed = t_start.elapsed();
 
     // Find the function index (in the *served* module's index space, which we don't change) of the
@@ -1021,14 +1168,13 @@ fn create_wasm_jump_table_fast(
     let t_emitted = t_start.elapsed();
 
     tracing::info!(
-        "Jump table (fast): parse={}ms analyze={}ms emit={}ms total={}ms | map={} repoint={} previous={} ifunc_count={ifunc_count} GOT.func={n_got_func} GOT.mem={n_got_mem} env_ifunc={n_env_ifunc} (sig-skipped {env_skipped_sig})",
+        "Jump table (fast): parse={}ms analyze={}ms emit={}ms total={}ms | map={} repoint={} ifunc_count={ifunc_count} GOT.func={n_got_func} GOT.mem={n_got_mem} env_ifunc={n_env_ifunc} (sig-skipped {env_skipped_sig})",
         t_parsed.as_millis(),
         t_analyzed.saturating_sub(t_parsed).as_millis(),
         t_emitted.saturating_sub(t_analyzed).as_millis(),
         t_emitted.as_millis(),
         map.len(),
         ifunc_repoint.len(),
-        previous_patch.as_ref().map_or(0, |p| p.repoint.len()),
     );
 
     if map.is_empty() {
@@ -1052,7 +1198,9 @@ fn create_wasm_jump_table_fast(
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
-        previous_patch,
+        earlier_patches: Vec::new(),
+        builds_on: None,
+        retired: Vec::new(),
         wasm: Some(WasmFixups {
             got_func,
             got_mem,
@@ -1061,7 +1209,7 @@ fn create_wasm_jump_table_fast(
         }),
         base_id: cache.base_id,
     };
-    Ok((table, Some(ifuncs)))
+    Ok((table, ifuncs))
 }
 
 /// Resolve a `GOT.mem` import's value: the absolute offset of the named data symbol in the base
@@ -1489,7 +1637,9 @@ fn create_wasm_jump_table_walrus(
         aslr_reference: 0,
         new_base_address: 0,
         ifunc_repoint,
-        previous_patch: None,
+        earlier_patches: Vec::new(),
+        builds_on: None,
+        retired: Vec::new(),
         wasm: None,
         base_id: cache.base_id,
     })
@@ -1629,6 +1779,264 @@ impl HotpatchModuleCache {
             .collect();
         PatchFunctions { roots, needed }
     }
+}
+
+impl HotpatchModuleCache {
+    /// The functions of a patch that defines every function that differs from the base: the
+    /// functions of `changed`, the functions that the earlier patches defined, and the
+    /// functions that reach one of them through direct calls in the base. Any tab can apply
+    /// such a patch.
+    pub fn self_contained_selection(
+        &self,
+        live: &LivePatches,
+        changed: &[String],
+    ) -> PatchSelection {
+        let functions = self.patch_functions(changed.iter().map(String::as_str));
+        let earlier_functions = self.patch_functions(live.functions.keys().map(String::as_str));
+        let mut wanted: HashSet<String> = functions
+            .needed
+            .iter()
+            .chain(&earlier_functions.needed)
+            .map(|name| name.to_string())
+            .collect();
+        wanted.extend(changed.iter().cloned());
+        wanted.extend(live.functions.keys().cloned());
+        let mut roots: Vec<String> = functions
+            .roots
+            .iter()
+            .chain(&earlier_functions.roots)
+            .map(|name| name.to_string())
+            .collect();
+        roots.sort_unstable();
+        roots.dedup();
+        PatchSelection {
+            seeds: changed.len(),
+            wanted,
+            roots,
+        }
+    }
+
+    /// The functions of a patch that builds on the last patch. The seeds are the functions
+    /// whose hash in `index` differs from the hash of their last definition: the hash in the
+    /// last patch that defined the function, else the hash in the base. `changed` holds the
+    /// functions that differ from the base.
+    pub fn incremental_selection(
+        &self,
+        live: &LivePatches,
+        index: &ObjectIndex,
+        changed: &[String],
+    ) -> PatchSelection {
+        let current = |name: &str| index.functions.get(name).map(|function| function.hash);
+        let mut seeds: Vec<&str> = Vec::new();
+        for name in changed {
+            let last = live.functions.get(name).and_then(|function| function.hash);
+            if current(name).is_some() && current(name) != last {
+                seeds.push(name);
+            }
+        }
+        let changed_set: HashSet<&str> = changed.iter().map(String::as_str).collect();
+        for (name, function) in &live.functions {
+            // A function that no longer differs from the base, but differs from its last
+            // definition: the edit took the code back to the base.
+            if !changed_set.contains(name.as_str())
+                && current(name).is_some()
+                && current(name) != function.hash
+            {
+                seeds.push(name);
+            }
+        }
+        let wanted = self.patch_functions_live(live, &seeds);
+        let mut roots: Vec<String> = wanted
+            .iter()
+            .filter(|name| self.symbol_ifunc_map.contains_key(*name))
+            .cloned()
+            .collect();
+        roots.sort_unstable();
+        PatchSelection {
+            seeds: seeds.len(),
+            wanted,
+            roots,
+        }
+    }
+
+    /// The functions that a patch that builds on the last patch must define, from the names of
+    /// the functions whose code changed since their last definition.
+    ///
+    /// The walk is the walk of `patch_functions`, on the live call graph: the call graph of the
+    /// base, where the edges of each function that a patch defined are the edges of its last
+    /// definition. A caller of a function is a function whose last definition calls it
+    /// directly, or a base function that calls it directly and that no patch defined. A
+    /// callee that the patch cannot import must be in the patch too: a function that a patch
+    /// defined and whose base slot does not hold the last definition, or a base function that
+    /// is neither in the table nor an export of the base.
+    pub fn patch_functions_live(&self, live: &LivePatches, seeds: &[&str]) -> HashSet<String> {
+        let mut index_names: Vec<Vec<&str>> = vec![Vec::new(); self.callers.len()];
+        for (name, index) in &self.symbol_func_index {
+            index_names[*index as usize].push(name.as_str());
+        }
+        let redefined = |index: u32| {
+            index_names[index as usize]
+                .iter()
+                .any(|name| live.functions.contains_key(*name))
+        };
+        let mut live_callers: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, function) in &live.functions {
+            for callee in &function.callees {
+                live_callers
+                    .entry(callee.as_str())
+                    .or_default()
+                    .push(name.as_str());
+            }
+        }
+
+        let mut needed: HashSet<&str> = HashSet::new();
+        let mut to_visit: Vec<&str> = seeds.to_vec();
+        while let Some(name) = to_visit.pop() {
+            if !needed.insert(name) {
+                continue;
+            }
+            if let Some(callers) = live_callers.get(name) {
+                to_visit.extend(callers.iter().copied());
+            }
+            if let Some(&index) = self.symbol_func_index.get(name) {
+                for &caller in &self.callers[index as usize] {
+                    if !redefined(caller) {
+                        to_visit.extend(index_names[caller as usize].iter().copied());
+                    }
+                }
+            }
+        }
+
+        let mut needed: HashSet<String> = needed.into_iter().map(str::to_string).collect();
+        self.add_live_callees(live, &mut needed);
+        needed
+    }
+
+    /// Add to `needed` every function that a function of `needed` calls directly in the live
+    /// call graph and that the patch cannot import, and their callees in turn. See
+    /// `patch_functions_live`.
+    pub fn add_live_callees(&self, live: &LivePatches, needed: &mut HashSet<String>) {
+        let mut index_names: Vec<Vec<&str>> = vec![Vec::new(); self.callers.len()];
+        for (name, index) in &self.symbol_func_index {
+            index_names[*index as usize].push(name.as_str());
+        }
+        let importable = |name: &str| match live.functions.get(name) {
+            Some(function) => function.base_slot,
+            None => match self.symbol_func_index.get(name) {
+                Some(&index) => {
+                    self.in_table[index as usize]
+                        || self.old_exports.contains(&self.func_names[index as usize])
+                }
+                // A name that is not a function of the base, such as an import of the base
+                // from the host.
+                None => true,
+            },
+        };
+        let mut to_visit: Vec<String> = needed.iter().cloned().collect();
+        while let Some(name) = to_visit.pop() {
+            let callees: Vec<&str> = match live.functions.get(&name) {
+                Some(function) => function.callees.iter().map(String::as_str).collect(),
+                None => match self.symbol_func_index.get(&name) {
+                    Some(&index) => self.callees[index as usize]
+                        .iter()
+                        .flat_map(|callee| index_names[*callee as usize].iter().copied())
+                        .collect(),
+                    None => Vec::new(),
+                },
+            };
+            for callee in callees {
+                if needed.contains(callee) || importable(callee) {
+                    continue;
+                }
+                needed.insert(callee.to_string());
+                to_visit.push(callee.to_string());
+            }
+        }
+    }
+}
+
+/// The functions of a linked wasm patch, from its import, code and name sections.
+pub struct PatchContents {
+    /// Each defined function, by name, with the names of the functions that it calls directly.
+    pub defined: HashMap<String, Vec<String>>,
+    /// The names of the functions that the patch imports from `env` or through `GOT.func`.
+    pub imported: Vec<String>,
+}
+
+/// Read the defined functions, their direct calls and the function imports of a linked patch.
+pub fn read_patch_contents(bytes: &[u8]) -> Result<PatchContents> {
+    let mut import_names: Vec<String> = Vec::new();
+    let mut imported: Vec<String> = Vec::new();
+    let mut calls: Vec<Vec<u32>> = Vec::new();
+    let mut names: HashMap<u32, String> = HashMap::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import?;
+                    match import.ty {
+                        wasmparser::TypeRef::Func(_) => {
+                            import_names.push(import.name.to_string());
+                            if import.module == "env" {
+                                imported.push(import.name.to_string());
+                            }
+                        }
+                        wasmparser::TypeRef::Global(_) if import.module == "GOT.func" => {
+                            imported.push(import.name.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut callees = Vec::new();
+                let mut reader = body.get_operators_reader()?;
+                while !reader.eof() {
+                    match reader.read()? {
+                        wasmparser::Operator::Call { function_index }
+                        | wasmparser::Operator::ReturnCall { function_index } => {
+                            callees.push(function_index)
+                        }
+                        _ => {}
+                    }
+                }
+                callees.sort_unstable();
+                callees.dedup();
+                calls.push(callees);
+            }
+            Payload::CustomSection(section) if section.name() == "name" => {
+                let reader =
+                    wasmparser::NameSectionReader::new(BinaryReader::new(section.data(), 0));
+                for subsection in reader {
+                    let Ok(wasmparser::Name::Function(map)) = subsection else {
+                        continue;
+                    };
+                    for naming in map {
+                        let naming = naming?;
+                        names.insert(naming.index, naming.name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let name_of = |index: u32| -> Option<String> {
+        match import_names.get(index as usize) {
+            Some(name) => Some(name.clone()),
+            None => names.get(&index).cloned(),
+        }
+    };
+    let imports = import_names.len() as u32;
+    let defined = calls
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, callees)| {
+            let name = names.get(&(imports + position as u32))?.clone();
+            let callees = callees.into_iter().filter_map(name_of).collect();
+            Some((name, callees))
+        })
+        .collect();
+    Ok(PatchContents { defined, imported })
 }
 
 /// The direct callers and the direct callees of every function of `module`, by wasm function
@@ -2407,7 +2815,7 @@ pub fn create_undefined_symbol_stub(
                             // Use JMP instruction to absolute address: FF 25 followed by 32-bit offset
                             // Then the 64-bit absolute address
                             let mut code = vec![0xFF, 0x25, 0x00, 0x00, 0x00, 0x00]; // jmp [rip+0]
-                                                                                     // Append the 64-bit address
+                            // Append the 64-bit address
                             code.extend_from_slice(&abs_addr.to_le_bytes());
                             code
                         }
@@ -2746,7 +3154,10 @@ fn find_wasm_func_index_by_name(bytes: &[u8], target: &str) -> Option<u32> {
 /// relocation thunk of the patch refers to them by index.
 ///
 /// A patch without an element section gets one, with the offset `global.get __table_base`.
+/// The linker imports the table only when an object of the patch uses it. A patch without the
+/// import gets the import `env.__indirect_function_table` too, because a segment needs a table.
 fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
+    const SECTION_IMPORT: u8 = 2;
     const SECTION_ELEMENT: u8 = 9;
     const SECTION_CODE: u8 = 10;
 
@@ -2758,6 +3169,7 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
     let mut imported_funcs = 0u32;
     let mut imported_globals = 0u32;
     let mut table_base_global = None;
+    let mut imports_table = false;
     let mut defined_funcs = 0u32;
     for payload in wasmparser::Parser::new(0).parse_all(input) {
         match payload? {
@@ -2772,6 +3184,7 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
                             }
                             imported_globals += 1;
                         }
+                        wasmparser::TypeRef::Table(_) => imports_table = true,
                         _ => {}
                     }
                 }
@@ -2789,6 +3202,7 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
     // other section byte for byte.
     let mut pos = 8;
     let mut element: Option<(usize, usize, usize)> = None; // (section start, payload start, end)
+    let mut import: Option<(usize, usize, usize)> = None;
     let mut code_start = None;
     while pos < input.len() {
         let section_start = pos;
@@ -2805,6 +3219,7 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
         }
         pos = payload_end;
         match section_id {
+            SECTION_IMPORT => import = Some((section_start, payload_start, payload_end)),
             SECTION_ELEMENT => element = Some((section_start, payload_start, payload_end)),
             SECTION_CODE if code_start.is_none() => code_start = Some(section_start),
             _ => {}
@@ -2853,7 +3268,9 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
         Some(target) => target,
         None => {
             let Some(global) = table_base_global else {
-                tracing::debug!("The patch has no `__table_base` global; the element segment stays");
+                tracing::debug!(
+                    "The patch has no `__table_base` global; the element segment stays"
+                );
                 return Ok(input.to_vec());
             };
             let mut expr = vec![0x23]; // global.get
@@ -2901,8 +3318,32 @@ fn extend_element_segment(input: &[u8]) -> Result<Vec<u8>> {
             (code_start, code_start)
         }
     };
-    let mut out = Vec::with_capacity(input.len() + section.len());
-    out.extend_from_slice(&input[..splice_start]);
+    let mut out = Vec::with_capacity(input.len() + section.len() + 40);
+    let mut copied = 0;
+    if !imports_table {
+        // The import section comes before the element section and the code section.
+        let Some((import_start, payload_start, payload_end)) = import else {
+            return Ok(input.to_vec());
+        };
+        let Some((count, count_len)) = read_uleb128(&input[payload_start..]) else {
+            return Ok(input.to_vec());
+        };
+        let mut payload = Vec::new();
+        write_uleb128(&mut payload, count + 1);
+        payload.extend_from_slice(&input[payload_start + count_len..payload_end]);
+        for name in ["env", "__indirect_function_table"] {
+            write_uleb128(&mut payload, name.len() as u32);
+            payload.extend_from_slice(name.as_bytes());
+        }
+        payload.extend_from_slice(&[0x01, 0x70, 0x00]); // table, funcref, no maximum
+        write_uleb128(&mut payload, ids.len() as u32); // the minimum size
+        out.extend_from_slice(&input[..import_start]);
+        out.push(SECTION_IMPORT);
+        write_uleb128(&mut out, payload.len() as u32);
+        out.extend_from_slice(&payload);
+        copied = payload_end;
+    }
+    out.extend_from_slice(&input[copied..splice_start]);
     out.extend_from_slice(&section);
     out.extend_from_slice(&input[splice_end..]);
     Ok(out)
@@ -3008,10 +3449,7 @@ fn encode_export_section(existing_payload: &[u8], reloc_export: Option<u32>) -> 
             break;
         };
         let name_end = name_leb + name_len as usize;
-        let Some((_, index_leb)) = entries
-            .get(name_end + 1..)
-            .and_then(read_uleb128)
-        else {
+        let Some((_, index_leb)) = entries.get(name_end + 1..).and_then(read_uleb128) else {
             break;
         };
         let entry_end = name_end + 1 + index_leb;
@@ -3637,7 +4075,10 @@ fn extend_element_segment_lists_every_defined_function() {
     // imports: one function `env.f` of type 0, one global `env.__table_base` (i32, const)
     let mut imports = Vec::new();
     write_uleb128(&mut imports, 2);
-    for (name, desc) in [("f", vec![0x00u8, 0x00]), ("__table_base", vec![0x03, 0x7f, 0x00])] {
+    for (name, desc) in [
+        ("f", vec![0x00u8, 0x00]),
+        ("__table_base", vec![0x03, 0x7f, 0x00]),
+    ] {
         write_uleb128(&mut imports, 3);
         imports.extend_from_slice(b"env");
         write_uleb128(&mut imports, name.len() as u32);
@@ -3676,6 +4117,26 @@ fn extend_element_segment_lists_every_defined_function() {
     let out = extend_element_segment(&without).unwrap();
     assert_eq!(segments_of(&out), vec![vec![1, 2, 3]]);
     assert!(out.ends_with(&code), "the code section stays as it was");
+
+    // The linker imports no table in these modules, so the pass adds the import. Without it,
+    // the segment names a table that does not exist, and the browser cannot compile the patch.
+    for out in [extend_element_segment(&with_segment).unwrap(), out] {
+        wasmparser::Validator::new()
+            .validate_all(&out)
+            .expect("the output must be a valid module");
+        let tables: Vec<String> = wasmparser::Parser::new(0)
+            .parse_all(&out)
+            .filter_map(|payload| match payload.unwrap() {
+                Payload::ImportSection(reader) => Some(reader),
+                _ => None,
+            })
+            .flatten()
+            .map(|import| import.unwrap())
+            .filter(|import| matches!(import.ty, wasmparser::TypeRef::Table(_)))
+            .map(|import| format!("{}.{}", import.module, import.name))
+            .collect();
+        assert_eq!(tables, vec!["env.__indirect_function_table"]);
+    }
 }
 
 #[test]
@@ -3750,7 +4211,10 @@ fn finalize_patch_wasm_edits() {
 
     assert!(!has_start, "start section should be dropped");
     assert!(exports.contains("main"), "existing exports preserved");
-    assert!(!exports.contains("extra"), "a linker root export is dropped");
+    assert!(
+        !exports.contains("extra"),
+        "a linker root export is dropped"
+    );
     assert!(
         exports.contains("__wasm_apply_global_relocs"),
         "relocs export added"
@@ -3768,8 +4232,14 @@ fn finalize_patch_wasm_edits() {
             kept_customs.insert(s.name().to_string());
         }
     }
-    assert!(kept_customs.contains("name"), "name section kept with --keep-names");
-    assert!(!kept_customs.contains("manganis"), "manganis still stripped");
+    assert!(
+        kept_customs.contains("name"),
+        "name section kept with --keep-names"
+    );
+    assert!(
+        !kept_customs.contains("manganis"),
+        "manganis still stripped"
+    );
 
     // With a DWARF sidecar, the `.debug_*` sections go too, and the `name` section stays.
     let split = finalize_patch_wasm(&m, Some(0), true, true).unwrap();
@@ -3779,9 +4249,18 @@ fn finalize_patch_wasm_edits() {
             split_customs.insert(s.name().to_string());
         }
     }
-    assert!(!split_customs.contains(".debug_info"), "DWARF stripped with a sidecar");
-    assert!(split_customs.contains("name"), "name section kept with a sidecar");
-    assert!(split_customs.contains("dylink.0"), "dylink preserved with a sidecar");
+    assert!(
+        !split_customs.contains(".debug_info"),
+        "DWARF stripped with a sidecar"
+    );
+    assert!(
+        split_customs.contains("name"),
+        "name section kept with a sidecar"
+    );
+    assert!(
+        split_customs.contains("dylink.0"),
+        "dylink preserved with a sidecar"
+    );
 }
 
 /// Manually parse the data section from a wasm module

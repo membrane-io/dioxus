@@ -388,6 +388,9 @@ pub struct BuildArtifacts {
     /// The workspace crates that a thin build replayed in place. The builder adds them to its
     /// cumulative set, so that a fallback inside the patch is not lost.
     pub(crate) replayed_in_place: HashSet<String>,
+
+    /// The functions that a wasm patch defines, from the link step. See `PatchDefinitions`.
+    pub(crate) patch_definitions: Option<crate::build::patch::PatchDefinitions>,
 }
 
 impl BuildRequest {
@@ -1265,6 +1268,7 @@ impl BuildRequest {
             patch_cache: None,
             build_id: ctx.build_id,
             replayed_in_place: HashSet::new(),
+            patch_definitions: None,
         })
     }
 
@@ -1971,9 +1975,7 @@ impl BuildRequest {
     pub(crate) fn build_rustflags(&self, build_mode: &BuildMode) -> cargo_config2::Flags {
         let mut rust_flags = self.rustflags.clone();
         if matches!(build_mode, BuildMode::Fat) && self.is_wasm_or_wasi() {
-            rust_flags
-                .flags
-                .push("-Crelocation-model=pic".to_string());
+            rust_flags.flags.push("-Crelocation-model=pic".to_string());
         }
         rust_flags
     }

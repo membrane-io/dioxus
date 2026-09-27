@@ -5,13 +5,13 @@ use std::{
     path::PathBuf,
 };
 
-/// See `JumpTable::previous_patch`.
+/// See `JumpTable::earlier_patches`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct PreviousPatch {
-    /// The `lib` of the previous jump table. A tab that did not apply that patch, because the
+    /// The `lib` of an earlier jump table. A tab that did not apply that patch, because the
     /// page loaded after it, skips the repoint.
     pub lib: PathBuf,
-    /// `(slot in the region of the previous patch, new ifunc index)`.
+    /// `(slot in the region of the earlier patch, new ifunc index)`.
     pub repoint: Vec<(u64, u64)>,
 }
 
@@ -75,14 +75,27 @@ pub struct JumpTable {
     #[serde(default)]
     pub ifunc_repoint: Vec<(u64, u64)>,
 
-    /// (wasm only) The patch before this one in the session, with the pairs `(slot in the
-    /// region of that patch, new ifunc index)` whose functions have the same signature. The
-    /// vtables and the function pointers in the data of the previous patch point into its
-    /// region. The runtime repoints that region, and every older slot that holds a function
-    /// of the previous patch, so that no slot keeps the previous module alive. New indices
-    /// are pre-rebase, like `ifunc_repoint`. `None` on the first patch after a fat build.
+    /// (wasm only) The earlier patches of the session that define a function of this patch,
+    /// with the pairs `(slot in the region of that patch, new ifunc index)` whose functions
+    /// have the same signature. The vtables and the function pointers in the data of an
+    /// earlier patch point into its region. The runtime repoints those slots, and every other
+    /// slot of an earlier region that holds a replaced function. New indices are pre-rebase,
+    /// like `ifunc_repoint`.
     #[serde(default)]
-    pub previous_patch: Option<PreviousPatch>,
+    pub earlier_patches: Vec<PreviousPatch>,
+
+    /// (wasm only) The `lib` of the patch that this patch builds on. This patch defines only
+    /// the functions that changed since that patch, and it calls the other functions of the
+    /// earlier patches through the base slots. A tab that did not apply that patch as its last
+    /// patch must not apply this one. `None` means that the patch defines every function that
+    /// differs from the base, so any tab can apply it.
+    #[serde(default)]
+    pub builds_on: Option<PathBuf>,
+
+    /// (wasm only) The `lib` of each earlier patch whose functions this patch replaced
+    /// completely. The runtime tells the stack trace code that those modules are old.
+    #[serde(default)]
+    pub retired: Vec<PathBuf>,
 
     /// (wasm only) Values the runtime must supply for the patch's dynamic-linking imports at
     /// instantiate time. When present, the CLI served the patch *without* rewriting it (no walrus

@@ -15,7 +15,7 @@
 //! source of truth is the read-out of the link args after the initial build
 
 use super::HotpatchModuleCache;
-use crate::build::patch::{ObjectIndex, PatchIfuncs};
+use crate::build::patch::{ObjectIndex, PatchDefinitions, PatchSelection};
 use crate::{BuildArtifacts, BuildMode, TipObjects, WorkspaceRustcArgs};
 use crate::{BuildContext, Error, LinkerFlavor, Result, RustcArgs, Workspace};
 use crate::{BuildRequest, DX_RUSTC_WRAPPER_ENV_VAR};
@@ -51,14 +51,15 @@ impl std::fmt::Display for ReplayFailed {
     }
 }
 
-/// Marks a thin build whose edit changed no function since the fat build. A cascade compiles
-/// the same functions again, so the fallback of the interface gate must not retry it.
+/// Marks a thin build whose edit changed no function since the last build: the last patch, or
+/// the fat build before the first patch. A cascade compiles the same functions again, so the
+/// fallback of the interface gate must not retry it.
 #[derive(Debug)]
 struct NothingToPatch;
 
 impl std::fmt::Display for NothingToPatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("No function changed since the fat build, so there is nothing to patch")
+        f.write_str("No function changed since the last build, so there is nothing to patch")
     }
 }
 
@@ -432,8 +433,10 @@ impl BuildRequest {
                 let args = self
                     .workspace_hotpatch_replay_args(&workspace_rustc_args, crate_name)
                     .with_context(|| format!("Missing rustc args for '{crate_name}'"))?;
-                let old = self.find_rlib_for_crate(crate_name, args, Some(old_dir.join(crate_name)))?;
-                let new = self.find_rlib_for_crate(crate_name, args, Some(new_dir.join(crate_name)))?;
+                let old =
+                    self.find_rlib_for_crate(crate_name, args, Some(old_dir.join(crate_name)))?;
+                let new =
+                    self.find_rlib_for_crate(crate_name, args, Some(new_dir.join(crate_name)))?;
                 let differences = rlib_object_differences(&old, &new)?;
                 if !differences.is_empty() {
                     differing.push((crate_name.clone(), differences));
@@ -446,7 +449,10 @@ impl BuildRequest {
         _ = std::fs::remove_dir_all(&pass_dir);
 
         let differing = result?;
-        let elapsed = started.elapsed().map(|d| d.as_secs_f32()).unwrap_or_default();
+        let elapsed = started
+            .elapsed()
+            .map(|d| d.as_secs_f32())
+            .unwrap_or_default();
         if differing.is_empty() {
             tracing::info!(
                 "Verified the skip of {} dependents of {out_of_place:?} in {elapsed:.1}s: \
@@ -602,12 +608,15 @@ impl BuildRequest {
         // the base. The roots are the needed functions that have a slot in the base table,
         // through `--export-if-defined`, in a response file because a name can hold a space
         // or an arrow. `finalize_patch_wasm` removes the exports again.
-        let mut roots: Vec<String> = Vec::new();
         let patch_objects_dir = self.patch_exe(tip.time_start).with_extension("objects");
+        let link_inputs = object_files.clone();
+        let mut select: Option<(ObjectIndex, Vec<String>)> = None;
+        let mut selection: Option<PatchSelection> = None;
+        let mut incremental = false;
         if self.linker_flavor() == LinkerFlavor::WasmLld {
             let t_select = std::time::Instant::now();
             let index = crate::build::patch::function_hashes(&object_files, &cache.file_hashes)?;
-            let seeds = self.changed_functions_since_base(
+            let changed = self.changed_functions_since_base(
                 &cache.file_hashes,
                 workspace_rustc_args,
                 modified_crates,
@@ -616,176 +625,247 @@ impl BuildRequest {
                 temp_objects.len(),
                 &index,
             )?;
-            let functions = cache.patch_functions(seeds.iter().map(String::as_str));
-            // A changed function that the base does not hold, a new function, is not in
-            // `needed`. The patch holds it too, for a caller that the patch holds.
-            // An earlier patch since the fat build repointed the slots of the functions it
-            // defined. The patch defines them again, so those slots repoint to the newest
-            // code, also when this edit took the code back to the base. An empty set here
-            // means the edit changed no code, and the app keeps the last patch.
-            let earlier: Vec<String> = cache
-                .patched_functions
-                .read()
-                .unwrap()
-                .iter()
-                .cloned()
-                .collect();
-            let earlier_functions = cache.patch_functions(earlier.iter().map(String::as_str));
-            let mut wanted: HashSet<&str> = functions.needed.clone();
-            wanted.extend(seeds.iter().map(String::as_str));
-            wanted.extend(earlier_functions.needed.iter().copied());
-            wanted.extend(earlier.iter().map(String::as_str));
-            if wanted.is_empty() {
+            // A patch after the first patch builds on the last patch. It defines only the
+            // functions that changed since their last definition, and the functions that must
+            // come with them. See `LivePatches`.
+            let live = cache.live.read().unwrap();
+            incremental = !live.regions.is_empty();
+            let chosen = if incremental {
+                cache.incremental_selection(&live, &index, &changed)
+            } else {
+                cache.self_contained_selection(&live, &changed)
+            };
+            drop(live);
+            // An empty selection means that the edit changed no code, and the app keeps the
+            // last patch.
+            if chosen.wanted.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "the link input holds no function that differs from the fat build"
+                    "the link input holds no function that differs from the last patch"
                 )
                 .context(NothingToPatch));
             }
-            cache
-                .patched_functions
-                .write()
-                .unwrap()
-                .extend(wanted.iter().map(|name| name.to_string()));
-            let (objects, missing) = index.objects_for(wanted.iter().copied());
-            if !missing.is_empty() {
-                tracing::debug!(
-                    "{} needed functions are in no object of the link, they become imports: {:?}",
-                    missing.len(),
-                    &missing[..missing.len().min(20)]
-                );
-            }
-            _ = std::fs::remove_dir_all(&patch_objects_dir);
-            std::fs::create_dir_all(&patch_objects_dir)
-                .context("Could not create the patch object dir")?;
-            object_files = index.write_objects(&object_files, &objects, &patch_objects_dir)?;
-            roots = functions
-                .roots
-                .iter()
-                .chain(&earlier_functions.roots)
-                .map(|name| name.to_string())
-                .collect();
-            roots.sort_unstable();
-            roots.dedup();
             tracing::debug!(
-                "Patch link input: {} changed functions, {} needed, {} roots, {} of {} objects, in {:?}",
-                seeds.len(),
-                wanted.len(),
-                roots.len(),
-                object_files.len(),
-                index.objects.len(),
+                "Patch selection: incremental={incremental}, {} changed since the base, {} seeds, {} needed, {} roots, in {:?}",
+                changed.len(),
+                chosen.seeds,
+                chosen.wanted.len(),
+                chosen.roots.len(),
                 t_select.elapsed()
             );
+            selection = Some(chosen);
+            select = Some((index, changed));
         }
 
-        // On non-wasm platforms, we generate a special shim object file which converts symbols from
-        // fat binary into direct addresses from the running process.
-        //
-        // Our wasm approach is quite specific to wasm. We don't need to resolve any missing symbols
-        // there since wasm is relocatable, but there is considerable pre and post processing work to
-        // satisfy undefined symbols that we do by munging the binary directly.
-        //
-        // todo: can we adjust our wasm approach to also use a similar system?
-        // todo: don't require the aslr reference and just patch the got when loading.
-        //
-        // Requiring the ASLR offset here is necessary but unfortunately might be flakey in practice.
-        // Android apps can take a long time to open, and a hot patch might've been issued in the interim,
-        // making this hotpatch a failure.
-        if !self.is_wasm_or_wasi() {
-            let stub_bytes = crate::build::create_undefined_symbol_stub(
-                cache,
-                &object_files,
-                &self.triple,
-                *aslr_reference,
-            )
-            .expect("failed to resolve patch symbols");
+        // A wasm patch can import a function that an earlier patch defined only when the base
+        // slot of the function holds the last definition. The selection finds most of the
+        // other functions from the live call graph, but not a call that the new code adds. So
+        // after the link, dx reads the imports of the patch. For each import of such a
+        // function, dx adds the function to the selection and links again. After
+        // `MAX_LINK_ATTEMPTS` attempts, dx links a self-contained patch.
+        const MAX_LINK_ATTEMPTS: usize = 3;
+        let mut attempts = 0;
+        let mut definitions: Option<PatchDefinitions> = None;
+        let out_exe = self.patch_exe(tip.time_start);
+        loop {
+            attempts += 1;
+            let mut object_files = link_inputs.clone();
+            let mut roots: Vec<String> = Vec::new();
+            if let (Some((index, _)), Some(selection)) = (&select, &selection) {
+                let (objects, missing) =
+                    index.objects_for(selection.wanted.iter().map(String::as_str));
+                if !missing.is_empty() {
+                    tracing::debug!(
+                        "{} needed functions are in no object of the link, they become imports: {:?}",
+                        missing.len(),
+                        &missing[..missing.len().min(20)]
+                    );
+                }
+                _ = std::fs::remove_dir_all(&patch_objects_dir);
+                std::fs::create_dir_all(&patch_objects_dir)
+                    .context("Could not create the patch object dir")?;
+                object_files = index.write_objects(&object_files, &objects, &patch_objects_dir)?;
+                roots = selection.roots.clone();
+                tracing::debug!(
+                    "Patch link input: attempt {attempts}, {} needed, {} roots, {} of {} objects",
+                    selection.wanted.len(),
+                    roots.len(),
+                    object_files.len(),
+                    index.objects.len(),
+                );
+            }
 
-            // Currently we're dropping stub.o in the exe dir, but should probably just move to a tempfile?
-            let patch_file = self.main_exe().with_file_name("stub.o");
-            std::fs::write(&patch_file, stub_bytes)?;
-            object_files.push(patch_file);
+            // On non-wasm platforms, we generate a special shim object file which converts symbols from
+            // fat binary into direct addresses from the running process.
+            //
+            // Our wasm approach is quite specific to wasm. We don't need to resolve any missing symbols
+            // there since wasm is relocatable, but there is considerable pre and post processing work to
+            // satisfy undefined symbols that we do by munging the binary directly.
+            //
+            // todo: can we adjust our wasm approach to also use a similar system?
+            // todo: don't require the aslr reference and just patch the got when loading.
+            //
+            // Requiring the ASLR offset here is necessary but unfortunately might be flakey in practice.
+            // Android apps can take a long time to open, and a hot patch might've been issued in the interim,
+            // making this hotpatch a failure.
+            if !self.is_wasm_or_wasi() {
+                let stub_bytes = crate::build::create_undefined_symbol_stub(
+                    cache,
+                    &object_files,
+                    &self.triple,
+                    *aslr_reference,
+                )
+                .expect("failed to resolve patch symbols");
 
-            // Add the dylibs/sos to the linker args
-            // Make sure to use the one in the bundle, not the ones in the target dir or system.
-            for arg in link_args {
-                if arg.ends_with(".dylib") || arg.ends_with(".so") {
-                    let path = PathBuf::from(arg);
-                    dylibs.push(self.frameworks_folder().join(path.file_name().unwrap()));
+                // Currently we're dropping stub.o in the exe dir, but should probably just move to a tempfile?
+                let patch_file = self.main_exe().with_file_name("stub.o");
+                std::fs::write(&patch_file, stub_bytes)?;
+                object_files.push(patch_file);
+
+                // Add the dylibs/sos to the linker args
+                // Make sure to use the one in the bundle, not the ones in the target dir or system.
+                for arg in link_args {
+                    if arg.ends_with(".dylib") || arg.ends_with(".so") {
+                        let path = PathBuf::from(arg);
+                        dylibs.push(self.frameworks_folder().join(path.file_name().unwrap()));
+                    }
                 }
             }
-        }
 
-        // And now we can run the linker with our new args
-        let linker = self.select_linker()?;
-        let out_exe = self.patch_exe(tip.time_start);
-        let out_arg = match self.triple.operating_system {
-            OperatingSystem::Windows => vec![format!("/OUT:{}", out_exe.display())],
-            _ => vec!["-o".to_string(), out_exe.display().to_string()],
-        };
+            // And now we can run the linker with our new args
+            let linker = self.select_linker()?;
+            let out_arg = match self.triple.operating_system {
+                OperatingSystem::Windows => vec![format!("/OUT:{}", out_exe.display())],
+                _ => vec!["-o".to_string(), out_exe.display().to_string()],
+            };
 
-        tracing::trace!("Linking with {:?} using args: {:#?}", linker, object_files);
-        tracing::trace!("Workspace hotpatch rlibs: {:#?}", workspace_rlibs);
+            tracing::trace!("Linking with {:?} using args: {:#?}", linker, object_files);
+            tracing::trace!("Workspace hotpatch rlibs: {:#?}", workspace_rlibs);
 
-        let mut out_args: Vec<OsString> = vec![];
-        out_args.extend(object_files.iter().map(Into::into));
-        out_args.extend(dylibs.iter().map(Into::into));
-        out_args.extend(self.thin_link_args(link_args)?.iter().map(Into::into));
+            let mut out_args: Vec<OsString> = vec![];
+            out_args.extend(object_files.iter().map(Into::into));
+            out_args.extend(dylibs.iter().map(Into::into));
+            out_args.extend(self.thin_link_args(link_args)?.iter().map(Into::into));
 
-        let roots_file = out_exe.with_extension("roots.rsp");
-        if self.linker_flavor() == LinkerFlavor::WasmLld {
-            let mut contents = String::new();
-            for name in roots.iter().sorted() {
-                contents.push_str("\"--export-if-defined=");
-                contents.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
-                contents.push_str("\"\n");
+            let roots_file = out_exe.with_extension("roots.rsp");
+            if self.linker_flavor() == LinkerFlavor::WasmLld {
+                let mut contents = String::new();
+                for name in roots.iter().sorted() {
+                    contents.push_str("\"--export-if-defined=");
+                    contents.push_str(&name.replace('\\', "\\\\").replace('"', "\\\""));
+                    contents.push_str("\"\n");
+                }
+                std::fs::write(&roots_file, contents)
+                    .context("Could not write the linker roots")?;
+                out_args.push(format!("@{}", roots_file.display()).into());
             }
-            std::fs::write(&roots_file, contents).context("Could not write the linker roots")?;
-            out_args.push(format!("@{}", roots_file.display()).into());
-        }
-        out_args.extend(out_arg.iter().map(Into::into));
+            out_args.extend(out_arg.iter().map(Into::into));
 
-        if cfg!(windows) {
-            let cmd_contents: String = out_args
+            if cfg!(windows) {
+                let cmd_contents: String = out_args
+                    .iter()
+                    .map(|s| format!("\"{}\"", s.to_string_lossy()))
+                    .join(" ");
+                std::fs::write(self.windows_command_file(), cmd_contents)
+                    .context("Failed to write linker command file")?;
+                out_args = vec![format!("@{}", self.windows_command_file().display()).into()];
+            }
+
+            // Add more search paths for the linker
+            let mut command_envs = args.envs.clone();
+
+            // On linux, we need to set a more complete PATH for the linker to find its libraries
+            if cfg!(target_os = "linux") {
+                command_envs.push(("PATH".to_string(), std::env::var("PATH").unwrap()));
+            }
+
+            // Run the linker directly!
+            //
+            // We dump its output directly into the patch exe location which is different than how rustc
+            // does it since it uses llvm-objcopy into the `target/debug/` folder.
+            ctx.profile_phase("Patch: Link");
+            let res = Command::new(linker)
+                .args(out_args)
+                .env_clear()
+                .envs(command_envs)
+                .output()
+                .await?;
+            _ = std::fs::remove_file(&roots_file);
+            _ = std::fs::remove_dir_all(&patch_objects_dir);
+
+            if !res.stderr.is_empty() {
+                let errs = String::from_utf8_lossy(&res.stderr);
+                if !self.patch_exe(tip.time_start).exists() || !res.status.success() {
+                    tracing::error!(
+                        telemetry = %serde_json::json!({ "event": "hotpatch_linker_failed" }),
+                        "Failed to generate patch: {}",
+                        errs.trim()
+                    );
+                } else {
+                    tracing::trace!("Linker output during thin linking: {}", errs.trim());
+                }
+            }
+
+            let Some((index, changed)) = &select else {
+                break;
+            };
+            if !res.status.success() {
+                break;
+            }
+            let bytes = std::fs::read(&out_exe).context("Could not read the patch")?;
+            let contents = crate::build::patch::read_patch_contents(&bytes)?;
+            let live = cache.live.read().unwrap();
+            let unresolved: Vec<String> = contents
+                .imported
                 .iter()
-                .map(|s| format!("\"{}\"", s.to_string_lossy()))
-                .join(" ");
-            std::fs::write(self.windows_command_file(), cmd_contents)
-                .context("Failed to write linker command file")?;
-            out_args = vec![format!("@{}", self.windows_command_file().display()).into()];
-        }
-
-        // Add more search paths for the linker
-        let mut command_envs = args.envs.clone();
-
-        // On linux, we need to set a more complete PATH for the linker to find its libraries
-        if cfg!(target_os = "linux") {
-            command_envs.push(("PATH".to_string(), std::env::var("PATH").unwrap()));
-        }
-
-        // Run the linker directly!
-        //
-        // We dump its output directly into the patch exe location which is different than how rustc
-        // does it since it uses llvm-objcopy into the `target/debug/` folder.
-        ctx.profile_phase("Patch: Link");
-        let res = Command::new(linker)
-            .args(out_args)
-            .env_clear()
-            .envs(command_envs)
-            .output()
-            .await?;
-        _ = std::fs::remove_file(&roots_file);
-        _ = std::fs::remove_dir_all(&patch_objects_dir);
-
-        if !res.stderr.is_empty() {
-            let errs = String::from_utf8_lossy(&res.stderr);
-            if !self.patch_exe(tip.time_start).exists() || !res.status.success() {
-                tracing::error!(
-                    telemetry = %serde_json::json!({ "event": "hotpatch_linker_failed" }),
-                    "Failed to generate patch: {}",
-                    errs.trim()
-                );
-            } else {
-                tracing::trace!("Linker output during thin linking: {}", errs.trim());
+                .filter(|name| {
+                    !contents.defined.contains_key(*name)
+                        && live
+                            .functions
+                            .get(*name)
+                            .is_some_and(|function| !function.base_slot)
+                })
+                .cloned()
+                .collect();
+            if !unresolved.is_empty() && incremental {
+                let selection = selection.as_mut().unwrap();
+                if attempts < MAX_LINK_ATTEMPTS {
+                    tracing::debug!(
+                        "The patch imports {} functions that it must define, dx links again: {:?}",
+                        unresolved.len(),
+                        &unresolved[..unresolved.len().min(20)]
+                    );
+                    selection.wanted.extend(unresolved);
+                    cache.add_live_callees(&live, &mut selection.wanted);
+                    selection.roots = selection
+                        .wanted
+                        .iter()
+                        .filter(|name| cache.symbol_ifunc_map.contains_key(*name))
+                        .cloned()
+                        .sorted()
+                        .collect();
+                } else {
+                    tracing::debug!(
+                        "The patch still imports {} functions that it must define after {attempts} attempts, dx links a self-contained patch",
+                        unresolved.len()
+                    );
+                    *selection = cache.self_contained_selection(&live, changed);
+                    incremental = false;
+                }
+                continue;
             }
+            drop(live);
+            definitions = Some(PatchDefinitions {
+                incremental,
+                functions: contents
+                    .defined
+                    .into_iter()
+                    .map(|(name, callees)| {
+                        let hash = index.functions.get(&name).map(|function| function.hash);
+                        (name, (hash, callees))
+                    })
+                    .collect(),
+            });
+            break;
         }
 
         // For some really weird reason that I think is because of dlopen caching, future loads of the
@@ -835,6 +915,7 @@ impl BuildRequest {
             depinfo: tip.depinfo,
             build_id: ctx.build_id,
             replayed_in_place: HashSet::new(),
+            patch_definitions: definitions,
         })
     }
 
@@ -882,16 +963,13 @@ impl BuildRequest {
                 let crate_overrides = overrides.get(crate_name).unwrap_or(&no_overrides);
                 level_jobs.push((crate_name, rustc_args, crate_overrides));
             }
-            let level_futures =
-                level_jobs
-                    .into_iter()
-                    .map(|(crate_name, rustc_args, crate_overrides)| async move {
-                        self.compile_dep_crate(ctx, crate_name, rustc_args, crate_overrides)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to replay workspace crate '{crate_name}'")
-                            })
-                    });
+            let level_futures = level_jobs.into_iter().map(
+                |(crate_name, rustc_args, crate_overrides)| async move {
+                    self.compile_dep_crate(ctx, crate_name, rustc_args, crate_overrides)
+                        .await
+                        .with_context(|| format!("Failed to replay workspace crate '{crate_name}'"))
+                },
+            );
             futures_util::future::try_join_all(level_futures).await?;
         }
         Ok(())
@@ -919,10 +997,7 @@ impl BuildRequest {
                     )
                 })?;
             }
-            moved.insert(
-                object.display().to_string(),
-                target.display().to_string(),
-            );
+            moved.insert(object.display().to_string(), target.display().to_string());
         }
 
         let kept: HashSet<PathBuf> = moved.values().map(PathBuf::from).collect();
@@ -2126,8 +2201,8 @@ impl BuildRequest {
         &self,
         patch: &Path,
         cache: &HotpatchModuleCache,
-        previous: Option<&PatchIfuncs>,
-    ) -> Result<(JumpTable, Option<PatchIfuncs>)> {
+        definitions: Option<&PatchDefinitions>,
+    ) -> Result<JumpTable> {
         use crate::build::patch::{
             create_native_jump_table, create_wasm_jump_table, create_windows_jump_table,
         };
@@ -2140,20 +2215,15 @@ impl BuildRequest {
         // - Wasm requires the walrus crate and actually modifies the patch file
         // - windows requires the pdb crate and pdb files
         // - nix requires the object crate
-        let mut ifuncs = None;
         let mut jump_table = match triple.operating_system {
             OperatingSystem::Windows => create_windows_jump_table(patch, cache)?,
-            _ if triple.architecture == Architecture::Wasm32 => {
-                let (table, patch_ifuncs) = create_wasm_jump_table(
-                    patch,
-                    cache,
-                    self.keep_wasm_names(),
-                    self.dwarf_sidecar,
-                    previous,
-                )?;
-                ifuncs = patch_ifuncs;
-                table
-            }
+            _ if triple.architecture == Architecture::Wasm32 => create_wasm_jump_table(
+                patch,
+                cache,
+                self.keep_wasm_names(),
+                self.dwarf_sidecar,
+                definitions,
+            )?,
             _ => create_native_jump_table(patch, triple, cache)?,
         };
 
@@ -2174,7 +2244,7 @@ impl BuildRequest {
             }
         }
 
-        Ok((jump_table, ifuncs))
+        Ok(jump_table)
     }
 
     /// Automatically detect the linker flavor based on the target triple and any custom linkers.

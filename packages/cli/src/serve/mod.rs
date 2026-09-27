@@ -118,14 +118,14 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                 aslr_reference,
                 pid,
             } => {
-                devserver
-                    .send_hotreload_to_new(builder.applied_hot_reload_changes(BuildId::PRIMARY))
-                    .await;
+                for msg in builder.applied_hot_reload_changes(BuildId::PRIMARY) {
+                    devserver.send_hotreload_to_new(msg).await;
+                }
 
                 if builder.server.is_some() {
-                    devserver
-                        .send_hotreload_to_new(builder.applied_hot_reload_changes(BuildId::SECONDARY))
-                        .await;
+                    for msg in builder.applied_hot_reload_changes(BuildId::SECONDARY) {
+                        devserver.send_hotreload_to_new(msg).await;
+                    }
                 }
 
                 builder.client_connected(id, aslr_reference, pid).await;
