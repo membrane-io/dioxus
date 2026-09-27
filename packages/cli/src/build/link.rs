@@ -631,7 +631,7 @@ impl BuildRequest {
             let live = cache.live.read().unwrap();
             incremental = !live.regions.is_empty();
             let chosen = if incremental {
-                cache.incremental_selection(&live, &index, &changed)
+                cache.incremental_selection(&live, &index, &object_files, &changed)
             } else {
                 cache.self_contained_selection(&live, &changed)
             };
@@ -829,13 +829,23 @@ impl BuildRequest {
             if !unresolved.is_empty() && incremental {
                 let selection = selection.as_mut().unwrap();
                 if attempts < MAX_LINK_ATTEMPTS {
+                    let callers: Vec<(&str, bool)> = contents
+                        .defined
+                        .iter()
+                        .filter(|(_, callees)| callees.iter().any(|c| unresolved.contains(c)))
+                        .map(|(name, _)| (name.as_str(), selection.wanted.contains(name)))
+                        .take(20)
+                        .collect();
                     tracing::debug!(
-                        "The patch imports {} functions that it must define, dx links again: {:?}",
+                        "The patch imports {} functions that it must define, dx links again: {:?}. The callers in the patch, and whether the selection holds each one: {:?}",
                         unresolved.len(),
-                        &unresolved[..unresolved.len().min(20)]
+                        &unresolved[..unresolved.len().min(20)],
+                        callers
                     );
                     selection.wanted.extend(unresolved);
-                    cache.add_live_callees(&live, &mut selection.wanted);
+                    let mut link_callees =
+                        crate::build::patch::LinkCallees::new(index, &link_inputs);
+                    cache.add_live_callees(&live, &mut selection.wanted, &mut link_callees);
                     selection.roots = selection
                         .wanted
                         .iter()
@@ -1966,6 +1976,7 @@ impl BuildRequest {
             let bytes = out_ar.into_inner().context("Failed to finalize archive")?;
             std::fs::write(&out_ar_path, bytes).context("Failed to write archive")?;
             tracing::debug!("Wrote fat archive to {:?}", out_ar_path);
+            remove_other_fat_archives(&out_ar_path, &out_rlibs_list);
 
             // Run the ranlib command to index the archive. This slows down this process a bit,
             // but is necessary for some linkers to work properly.
@@ -2569,9 +2580,71 @@ fn sweep_thin_build_byproducts(deps_dir: &Path) -> (usize, u64) {
     (files_removed, bytes_freed)
 }
 
+/// Delete the fat archives and the rlib lists of earlier fat builds next to `archive`. The
+/// name of an archive holds a hash of the modification times of the rlibs, so a later fat build
+/// almost never reuses an earlier archive. Each archive of gaze has about 400 MB, and without
+/// this removal the directory grew by one archive for each fat build.
+fn remove_other_fat_archives(archive: &Path, rlibs_list: &Path) {
+    let Some(dir) = archive.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files_removed = 0;
+    let mut bytes_freed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == archive || path == rlibs_list {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let earlier_archive = name.starts_with("libdeps-") && name.ends_with(".a");
+        let earlier_list = name.starts_with("rlibs-") && name.ends_with(".txt");
+        if !earlier_archive && !earlier_list {
+            continue;
+        }
+        let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            files_removed += 1;
+            bytes_freed += len;
+        }
+    }
+    if files_removed > 0 {
+        tracing::debug!(
+            "Removed {files_removed} fat archives and rlib lists of earlier fat builds, {} MB",
+            bytes_freed / 1_000_000
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_other_fat_archives_keeps_the_current_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            path
+        };
+        let archive = file("libdeps-aaaa.a");
+        let list = file("rlibs-aaaa.txt");
+        file("libdeps-bbbb.a");
+        file("rlibs-bbbb.txt");
+        let other = file("gaze.wasm");
+        remove_other_fat_archives(&archive, &list);
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["gaze.wasm", "libdeps-aaaa.a", "rlibs-aaaa.txt"]);
+        assert!(other.exists());
+    }
 
     #[test]
     fn byproduct_predicate_matches_only_save_temps_files() {

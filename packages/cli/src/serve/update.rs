@@ -15,6 +15,10 @@ pub(crate) enum ServeUpdate {
     WsMessage {
         bundle: BundleFormat,
         msg: WsMessage,
+        /// The index of the socket that sent the message, for a reply with
+        /// `WebServer::send_hotreload_to`. The index is valid until the next call of
+        /// `WebServer::wait`.
+        socket: usize,
     },
 
     /// An update regarding the state of the build and running app from an AppBuilder

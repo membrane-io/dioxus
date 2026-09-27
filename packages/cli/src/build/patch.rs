@@ -1824,6 +1824,7 @@ impl HotpatchModuleCache {
         &self,
         live: &LivePatches,
         index: &ObjectIndex,
+        paths: &[PathBuf],
         changed: &[String],
     ) -> PatchSelection {
         let current = |name: &str| index.functions.get(name).map(|function| function.hash);
@@ -1845,7 +1846,8 @@ impl HotpatchModuleCache {
                 seeds.push(name);
             }
         }
-        let wanted = self.patch_functions_live(live, &seeds);
+        let mut link_callees = LinkCallees::new(index, paths);
+        let wanted = self.patch_functions_live(live, &seeds, &mut link_callees);
         let mut roots: Vec<String> = wanted
             .iter()
             .filter(|name| self.symbol_ifunc_map.contains_key(*name))
@@ -1869,7 +1871,12 @@ impl HotpatchModuleCache {
     /// callee that the patch cannot import must be in the patch too: a function that a patch
     /// defined and whose base slot does not hold the last definition, or a base function that
     /// is neither in the table nor an export of the base.
-    pub fn patch_functions_live(&self, live: &LivePatches, seeds: &[&str]) -> HashSet<String> {
+    pub fn patch_functions_live(
+        &self,
+        live: &LivePatches,
+        seeds: &[&str],
+        link_callees: &mut LinkCallees,
+    ) -> HashSet<String> {
         let mut index_names: Vec<Vec<&str>> = vec![Vec::new(); self.callers.len()];
         for (name, index) in &self.symbol_func_index {
             index_names[*index as usize].push(name.as_str());
@@ -1908,14 +1915,27 @@ impl HotpatchModuleCache {
         }
 
         let mut needed: HashSet<String> = needed.into_iter().map(str::to_string).collect();
-        self.add_live_callees(live, &mut needed);
+        self.add_live_callees(live, &mut needed, link_callees);
         needed
     }
 
-    /// Add to `needed` every function that a function of `needed` calls directly in the live
-    /// call graph and that the patch cannot import, and their callees in turn. See
-    /// `patch_functions_live`.
-    pub fn add_live_callees(&self, live: &LivePatches, needed: &mut HashSet<String>) {
+    /// Add to `needed` every function that a function of `needed` calls directly and that the
+    /// patch cannot import, and their callees in turn. See `patch_functions_live`.
+    ///
+    /// The callees of a function that the link input defines come from its object, because
+    /// the patch links that code. So a call that the edit added is visible before the link.
+    /// The callees of another function come from the live call graph.
+    ///
+    /// The link loads the object of each function of `needed`. wasm-ld then also defines each
+    /// other function of such an object that the patch calls, although the patch could import
+    /// it. The walk follows the callees of such a function too, but it does not add the
+    /// function to `needed`.
+    pub fn add_live_callees(
+        &self,
+        live: &LivePatches,
+        needed: &mut HashSet<String>,
+        link_callees: &mut LinkCallees,
+    ) {
         let mut index_names: Vec<Vec<&str>> = vec![Vec::new(); self.callers.len()];
         for (name, index) in &self.symbol_func_index {
             index_names[*index as usize].push(name.as_str());
@@ -1932,11 +1952,22 @@ impl HotpatchModuleCache {
                 None => true,
             },
         };
-        let mut to_visit: Vec<String> = needed.iter().cloned().collect();
-        while let Some(name) = to_visit.pop() {
-            let callees: Vec<&str> = match live.functions.get(&name) {
-                Some(function) => function.callees.iter().map(String::as_str).collect(),
-                None => match self.symbol_func_index.get(&name) {
+        // The objects that the link loads, the importable functions that the link defines
+        // because it loads their object, and the importable callees of each object that the
+        // link does not load yet.
+        let mut walk = LinkWalk::default();
+        walk.to_visit = needed.iter().cloned().collect();
+        for name in needed.iter() {
+            if let Some(object) = link_callees.object_of(name) {
+                walk.load(object, link_callees, needed);
+            }
+        }
+        while let Some(name) = walk.to_visit.pop() {
+            let object_callees = link_callees.callees(&name);
+            let callees: Vec<&str> = match (&object_callees, live.functions.get(&name)) {
+                (Some(callees), _) => callees.iter().map(String::as_str).collect(),
+                (None, Some(function)) => function.callees.iter().map(String::as_str).collect(),
+                (None, None) => match self.symbol_func_index.get(&name) {
                     Some(&index) => self.callees[index as usize]
                         .iter()
                         .flat_map(|callee| index_names[*callee as usize].iter().copied())
@@ -1945,11 +1976,64 @@ impl HotpatchModuleCache {
                 },
             };
             for callee in callees {
-                if needed.contains(callee) || importable(callee) {
+                if needed.contains(callee) || walk.defined_by_link.contains(callee) {
+                    continue;
+                }
+                let object = link_callees.object_of(callee);
+                if importable(callee) {
+                    match object {
+                        Some(object) if walk.linked.contains(&object) => {
+                            walk.defined_by_link.insert(callee.to_string());
+                            walk.to_visit.push(callee.to_string());
+                        }
+                        Some(object) => walk
+                            .waiting
+                            .entry(object)
+                            .or_default()
+                            .push(callee.to_string()),
+                        None => {}
+                    }
                     continue;
                 }
                 needed.insert(callee.to_string());
-                to_visit.push(callee.to_string());
+                walk.to_visit.push(callee.to_string());
+                if let Some(object) = object {
+                    walk.load(object, link_callees, needed);
+                }
+            }
+        }
+    }
+}
+
+/// The state of the walk of `add_live_callees` over the objects that the link loads.
+#[derive(Default)]
+struct LinkWalk {
+    linked: HashSet<usize>,
+    defined_by_link: HashSet<String>,
+    waiting: HashMap<usize, Vec<String>>,
+    to_visit: Vec<String>,
+}
+
+impl LinkWalk {
+    /// Record that the link loads `object`, and the objects that `objects_for` loads with it:
+    /// the objects that define the hidden functions whose address a loaded object takes. The
+    /// link defines each such hidden function, and each function that waited for a loaded
+    /// object, so the walk follows them.
+    fn load(&mut self, object: usize, link_callees: &LinkCallees, needed: &HashSet<String>) {
+        let mut objects = vec![object];
+        while let Some(object) = objects.pop() {
+            if !self.linked.insert(object) {
+                continue;
+            }
+            let hidden = link_callees.hidden_address_refs(object);
+            let defined = self.waiting.remove(&object).unwrap_or_default();
+            for name in defined.into_iter().chain(hidden.iter().cloned()) {
+                if let Some(object) = link_callees.object_of(&name) {
+                    objects.push(object);
+                }
+                if !needed.contains(&name) && self.defined_by_link.insert(name.clone()) {
+                    self.to_visit.push(name);
+                }
             }
         }
     }
@@ -2311,6 +2395,162 @@ impl ObjectIndex {
         }
         Ok(out)
     }
+}
+
+/// The direct callees of the functions of the link input, from the objects that define them.
+/// The reader parses an object only when a caller asks for a function of that object, and it
+/// keeps the result for the life of the selection.
+pub struct LinkCallees<'a> {
+    index: &'a ObjectIndex,
+    paths: &'a [PathBuf],
+    objects: HashMap<usize, HashMap<String, Vec<String>>>,
+}
+
+impl<'a> LinkCallees<'a> {
+    pub fn new(index: &'a ObjectIndex, paths: &'a [PathBuf]) -> Self {
+        Self {
+            index,
+            paths,
+            objects: HashMap::new(),
+        }
+    }
+
+    /// The hidden functions whose address `object` takes, see `PatchObject`.
+    fn hidden_address_refs(&self, object: usize) -> &[String] {
+        &self.index.objects[object].hidden_address_refs
+    }
+
+    /// The object of the link input that defines `name`, as an index into
+    /// `ObjectIndex::objects`.
+    pub fn object_of(&self, name: &str) -> Option<usize> {
+        self.index
+            .functions
+            .get(name)
+            .map(|function| function.object)
+    }
+
+    /// The names of the functions that `name` calls directly in its object. Returns `None`
+    /// when no object of the link input defines `name`, or when the object cannot be read.
+    pub fn callees(&mut self, name: &str) -> Option<Vec<String>> {
+        let object = self.index.functions.get(name)?.object;
+        if !self.objects.contains_key(&object) {
+            let callees = self.read_object(object).unwrap_or_else(|error| {
+                tracing::debug!("Could not read the callees of object {object}: {error:#}");
+                HashMap::new()
+            });
+            self.objects.insert(object, callees);
+        }
+        self.objects[&object].get(name).cloned()
+    }
+
+    /// Read the object from its file. For a member of an archive, the function reads only the
+    /// bytes of the member, because the walk visits the objects of many archives in turn.
+    fn read_object(&self, object: usize) -> anyhow::Result<HashMap<String, Vec<String>>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let PatchObject { source, member, .. } = &self.index.objects[object];
+        let path = &self.paths[*source];
+        let Some(range) = member else {
+            return direct_callees(&std::fs::read(path)?);
+        };
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(range.start as u64))?;
+        let mut bytes = vec![0; range.len()];
+        file.read_exact(&mut bytes)
+            .with_context(|| format!("Could not read a member of {}", path.display()))?;
+        direct_callees(&bytes)
+    }
+}
+
+/// The names of the functions that each defined function of one wasm object calls directly,
+/// from the `call` relocations of the code section.
+fn direct_callees(bytes: &[u8]) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    use wasmparser::{KnownCustom, RelocationType, TypeRef};
+
+    let mut import_funcs: Vec<String> = Vec::new();
+    let mut code_start = 0usize;
+    let mut bodies: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut symbols: Vec<SymbolInfo> = Vec::new();
+    let mut relocs: Vec<wasmparser::RelocationEntry> = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::ImportSection(section) => {
+                for import in section {
+                    let import = import?;
+                    if let TypeRef::Func(_) = import.ty {
+                        import_funcs.push(import.name.to_string());
+                    }
+                }
+            }
+            Payload::CodeSectionStart { range, .. } => code_start = range.start,
+            Payload::CodeSectionEntry(body) => bodies.push(body.range()),
+            Payload::CustomSection(section) => match section.as_known() {
+                KnownCustom::Linking(reader) => {
+                    for subsection in reader.subsections() {
+                        if let Linking::SymbolTable(map) = subsection? {
+                            symbols = map.into_iter().collect::<Result<Vec<_>, _>>()?;
+                        }
+                    }
+                }
+                KnownCustom::Reloc(reader) if section.name() == "reloc.CODE" => {
+                    relocs = reader
+                        .entries()
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    // The name of each function symbol, as in `hash_object_functions`.
+    let function_name = |symbol: &SymbolInfo| match symbol {
+        SymbolInfo::Func { index, name, .. } => Some(match name {
+            Some(name) => name.to_string(),
+            None => import_funcs.get(*index as usize)?.clone(),
+        }),
+        _ => None,
+    };
+    let mut defined_names: HashMap<u32, &str> = HashMap::new();
+    for symbol in &symbols {
+        if let SymbolInfo::Func {
+            index,
+            name: Some(name),
+            ..
+        } = symbol
+        {
+            if *index as usize >= import_funcs.len() {
+                defined_names.insert(*index, name);
+            }
+        }
+    }
+
+    relocs.sort_by_key(|reloc| reloc.offset);
+    let mut callees: HashMap<String, Vec<String>> = HashMap::new();
+    let mut next_reloc = 0;
+    for (position, body) in bodies.iter().enumerate() {
+        let start = body.start - code_start;
+        let end = body.end - code_start;
+        let mut calls: Vec<String> = Vec::new();
+        while next_reloc < relocs.len() && (relocs[next_reloc].offset as usize) < end {
+            let reloc = relocs[next_reloc];
+            next_reloc += 1;
+            if (reloc.offset as usize) < start || reloc.ty != RelocationType::FunctionIndexLeb {
+                continue;
+            }
+            if let Some(name) = symbols.get(reloc.index as usize).and_then(function_name) {
+                calls.push(name);
+            }
+        }
+        calls.sort_unstable();
+        calls.dedup();
+        let index_of_function = (import_funcs.len() + position) as u32;
+        if let Some(name) = defined_names.get(&index_of_function) {
+            callees.insert((*name).to_string(), calls);
+        }
+    }
+    Ok(callees)
 }
 
 /// Hash every defined function of one wasm object into `index`, and record the object. See
@@ -4579,4 +4819,45 @@ fn data_edit_changes_the_function_hash() {
     // `g` reads a named static. Its content is not local data, so a patch cannot replace it
     // and the hash does not cover it.
     assert_eq!(g_old, g_new);
+}
+
+#[test]
+fn direct_callees_reads_the_calls_of_the_object() {
+    // `f` calls the local function `g` and the undefined function `h`. `g` calls nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("lib.rs");
+    let object = dir.path().join("lib.o");
+    std::fs::write(
+        &source,
+        "unsafe extern \"C\" { fn h(); }\n\
+         #[unsafe(no_mangle)] #[inline(never)] pub fn g() -> u32 { 1 }\n\
+         #[unsafe(no_mangle)] pub fn f() -> u32 { unsafe { h() }; g() }\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new("rustc")
+        .args([
+            "--edition=2024",
+            "--crate-type=lib",
+            "--target=wasm32-unknown-unknown",
+            "--emit=obj",
+            "-Copt-level=0",
+            "-o",
+        ])
+        .arg(&object)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let callees = direct_callees(&std::fs::read(&object).unwrap()).unwrap();
+    assert_eq!(callees["f"], vec!["g".to_string(), "h".to_string()]);
+    assert!(callees["g"].is_empty());
+
+    let index = hash_file_functions(&object).unwrap();
+    let paths = [object.clone()];
+    let mut link_callees = LinkCallees::new(&index, &paths);
+    assert_eq!(
+        link_callees.callees("f"),
+        Some(vec!["g".to_string(), "h".to_string()])
+    );
+    assert_eq!(link_callees.callees("h"), None);
 }

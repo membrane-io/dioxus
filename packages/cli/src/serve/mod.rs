@@ -133,16 +133,45 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
 
             // Received a message from the devtools server - currently we only use this for
             // logging, so we just forward it the tui
-            ServeUpdate::WsMessage { msg, bundle } => {
-                if let axum::extract::ws::Message::Text(text) = &msg
-                    && let Ok(dioxus_devtools_types::ClientMsg::FullRebuild) =
-                        serde_json::from_str::<dioxus_devtools_types::ClientMsg>(text.as_str())
-                {
-                    tracing::info!("Full rebuild: triggered by client");
-                    builder.full_rebuild().await;
-                    devserver.send_reload_start().await;
-                    devserver.start_build().await;
-                    continue;
+            ServeUpdate::WsMessage {
+                msg,
+                bundle,
+                socket,
+            } => {
+                let client_msg = match &msg {
+                    axum::extract::ws::Message::Text(text) => {
+                        serde_json::from_str::<dioxus_devtools_types::ClientMsg>(text.as_str()).ok()
+                    }
+                    _ => None,
+                };
+                match client_msg {
+                    Some(dioxus_devtools_types::ClientMsg::FullRebuild) => {
+                        tracing::info!("Full rebuild: triggered by client");
+                        builder.full_rebuild().await;
+                        devserver.send_reload_start().await;
+                        devserver.start_build().await;
+                        continue;
+                    }
+                    // The client skips each patch that it applied already, so the whole chain
+                    // gives it the patches that it missed.
+                    Some(dioxus_devtools_types::ClientMsg::MissedPatch) => {
+                        let messages =
+                            builder.applied_hot_reload_changes(devserver.socket_build(socket));
+                        tracing::info!(
+                            "A client missed a patch. dx sends it the {} patches of the session again",
+                            messages
+                                .iter()
+                                .filter(|msg| msg.jump_table.is_some())
+                                .count()
+                        );
+                        for msg in messages {
+                            if !devserver.send_hotreload_to(socket, msg).await {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
 
                 screen.push_ws_message(bundle, &msg);

@@ -185,7 +185,7 @@ impl WebServer {
                 }
                 Some((idx, message)) = new_message.next() => {
                     match message {
-                        Some(Ok(msg)) => return ServeUpdate::WsMessage { msg, bundle: BundleFormat::Web },
+                        Some(Ok(msg)) => return ServeUpdate::WsMessage { msg, bundle: BundleFormat::Web, socket: idx },
                         _ => {
                             drop(new_message);
                             _ = self.hot_reload_sockets.remove(idx);
@@ -377,6 +377,35 @@ impl WebServer {
         if socket.socket.send(Message::Text(msg.into())).await.is_err() {
             self.hot_reload_sockets.pop();
         }
+    }
+
+    /// Send `reload` to the socket at `index` only, see `ServeUpdate::WsMessage`. Returns
+    /// false when the send failed. The function then removes the socket, and each later index
+    /// names another socket.
+    pub(crate) async fn send_hotreload_to(&mut self, index: usize, reload: HotReloadMsg) -> bool {
+        if reload.is_empty() {
+            return true;
+        }
+
+        let msg = DevserverMsg::HotReload(reload);
+        let msg = serde_json::to_string(&msg).unwrap();
+
+        let Some(socket) = self.hot_reload_sockets.get_mut(index) else {
+            return false;
+        };
+        if socket.socket.send(Message::Text(msg.into())).await.is_err() {
+            self.hot_reload_sockets.remove(index);
+            return false;
+        }
+        true
+    }
+
+    /// The build of the socket at `index`, see `ServeUpdate::WsMessage`.
+    pub(crate) fn socket_build(&self, index: usize) -> BuildId {
+        self.hot_reload_sockets
+            .get(index)
+            .and_then(|socket| socket.build_id)
+            .unwrap_or(BuildId::PRIMARY)
     }
 
     pub(crate) async fn send_patch(

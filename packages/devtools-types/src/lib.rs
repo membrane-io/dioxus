@@ -40,6 +40,9 @@ pub enum ClientMsg {
     /// Ask the devserver to do a full rebuild — equivalent to pressing `r` in the TUI.
     /// Useful when a hot-patch leaves the running app in an unrecoverable state.
     FullRebuild,
+    /// The client received a patch that builds on a patch that it did not apply. The
+    /// devserver sends the patches of the session again, to this client only.
+    MissedPatch,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]

@@ -628,16 +628,39 @@ async fn apply_wasm_patch(mut table: JumpTable) {
         }
     }
 
+    // dx sends the patches again when the tab asks for the patches that it missed. The tab
+    // skips each patch that it applied already.
+    if APPLIED.with(|applied| {
+        applied
+            .borrow()
+            .iter()
+            .any(|p| same_lib(&p.lib, &table.lib))
+    }) {
+        return;
+    }
+
     // A patch that builds on an earlier patch holds only the functions that changed since
     // that patch. The tab must have applied that patch last, else the patch leaves the tab
-    // with a mix of old and new code.
+    // with a mix of old and new code. The tab then asks dx for the patches again, through the
+    // `subsecondMissedPatch` function of the page, one time for each missing patch.
     if let Some(builds_on) = &table.builds_on {
         let last = APPLIED.with(|applied| applied.borrow().last().map(|p| p.lib.clone()));
         if !last.as_ref().is_some_and(|last| same_lib(last, builds_on)) {
+            let asked_before = ASKED_FOR.with(|asked| {
+                asked
+                    .replace(Some(builds_on.clone()))
+                    .is_some_and(|asked| same_lib(&asked, builds_on))
+            });
+            let ask = (!asked_before).then(missed_patch_hook).flatten();
+            let next_step = if ask.is_some() {
+                "The tab asks dx for the patches again."
+            } else {
+                "Reload the page to get all the patches."
+            };
             web_sys::console::warn_1(
                 &format!(
                     "[subsecond] skipping patch {}: it builds on patch {}, and this tab \
-                         applied {} last. Reload the page to get all the patches.",
+                         applied {} last. {next_step}",
                     table.lib.display(),
                     builds_on.display(),
                     last.as_ref()
@@ -645,6 +668,9 @@ async fn apply_wasm_patch(mut table: JumpTable) {
                 )
                 .into(),
             );
+            if let Some(ask) = ask {
+                let _ = ask.call0(&wasm_bindgen::JsValue::UNDEFINED);
+            }
             return;
         }
     }
@@ -1060,6 +1086,23 @@ thread_local! {
     /// The patches that this tab applied since the page loaded, in order.
     static APPLIED: std::cell::RefCell<Vec<AppliedPatch>> = const { std::cell::RefCell::new(Vec::new()) };
     static PATCH_QUEUE: std::cell::RefCell<PatchQueue> = std::cell::RefCell::new(PatchQueue::default());
+    /// The missing patch for which the tab last asked dx to send the patches again.
+    static ASKED_FOR: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The `subsecondMissedPatch` function of the page, or `None` when the page did not install
+/// it. The function asks dx to send the patches of the session again.
+#[cfg(target_arch = "wasm32")]
+fn missed_patch_hook() -> Option<js_sys::Function> {
+    use wasm_bindgen::{JsCast, JsValue};
+
+    js_sys::Reflect::get(
+        &js_sys::global(),
+        &JsValue::from_str("subsecondMissedPatch"),
+    )
+    .ok()?
+    .dyn_into::<js_sys::Function>()
+    .ok()
 }
 
 /// True when `a` and `b` name the same patch. dx sends the path of a patch with and without a
