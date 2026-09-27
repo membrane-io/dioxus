@@ -2403,7 +2403,9 @@ impl BuildRequest {
                 }
                 _ => artifacts.exe.to_path_buf(),
             };
+            let started = std::time::Instant::now();
             let hotpatch_module_cache = HotpatchModuleCache::new(&patch_exe, &self.triple)?;
+            tracing::debug!("Created the patch cache in {:?}", started.elapsed());
             artifacts.patch_cache = Some(Arc::new(hotpatch_module_cache));
 
             // The unstripped sibling is only needed by the cache; remove it now to

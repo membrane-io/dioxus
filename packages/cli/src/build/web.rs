@@ -105,15 +105,21 @@ impl BuildRequest {
         if self.dwarf_sidecar {
             let sidecar = self.wasm_bindgen_sidecar_file();
             tracing::debug!(dx_src = ?TraceSrc::Bundle, "Copying the linker output to the DWARF sidecar {}", sidecar.display());
+            let started = std::time::Instant::now();
             std::fs::copy(exe, &sidecar)?;
+            tracing::debug!(dx_src = ?TraceSrc::Bundle, "Copied the DWARF sidecar in {:?}", started.elapsed());
         }
 
         // Lift the internal functions to exports
         if ctx.mode == BuildMode::Fat {
+            let started = std::time::Instant::now();
             let unprocessed = std::fs::read(exe)?;
+            let read = started.elapsed();
             let all_exported_bytes =
                 crate::build::prepare_wasm_base_module(&unprocessed, !self.dwarf_sidecar)?;
+            let prepared = started.elapsed();
             std::fs::write(exe, all_exported_bytes)?;
+            tracing::debug!(dx_src = ?TraceSrc::Bundle, "Prepared the base module: read {read:?}, prepare {:?}, write {:?}", prepared - read, started.elapsed() - prepared);
         }
 
         // Prepare our configuration
@@ -278,6 +284,7 @@ impl BuildRequest {
         // populate the cache from the linker metadata. wasm-opt already strips these
         // for release / wasm_split paths, so skip there.
         if matches!(ctx.mode, BuildMode::Fat) && !should_bundle_split && !self.release {
+            let started = std::time::Instant::now();
             let bytes = std::fs::read(&post_bindgen_wasm)?;
             let unstripped_path =
                 post_bindgen_wasm.with_extension(UNSTRIPPED_WASM_EXTENSION);
@@ -290,6 +297,7 @@ impl BuildRequest {
                 stripped.len()
             );
             std::fs::write(&post_bindgen_wasm, stripped)?;
+            tracing::debug!(dx_src = ?TraceSrc::Bundle, "Wrote the unstripped and the stripped wasm in {:?}", started.elapsed());
         }
 
         if self.should_bundle_to_asset() {

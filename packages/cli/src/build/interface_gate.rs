@@ -176,6 +176,11 @@ fn added_items(old: &[Item], new: &[Item], added: &mut Vec<String>) -> Result<()
                 }
                 _ => {}
             }
+            // An item with the same kind and name in both files changed. It is not new, and
+            // the message must name the change.
+            if describe_item(&old[i]) == describe_item(&new[j]) {
+                return Err(describe_item_change(&old[i], &new[j]));
+            }
         }
         match additive_item(&new[j]) {
             Some(name) => {
@@ -1390,6 +1395,18 @@ mod tests {
             "fn helper<T>(_: T) -> u32 { make_impl! { A } 1 }",
             "fn helper<T>(_: T) -> u32 { make_impl! { A } 2 }",
         ));
+    }
+
+    #[test]
+    fn changed_kept_fn_message_names_the_change() {
+        let old = syn::parse_file("pub fn f<T>(_: T) -> u32 { 1 } pub fn g() {}").unwrap();
+        let new = syn::parse_file("pub fn f<T>(_: T) -> u32 { 2 } pub fn g() {}").unwrap();
+        assert_eq!(
+            interface_change(&old, &new),
+            InterfaceChange::Changed(
+                "fn f, whose body is kept because it is a generic fn".to_string()
+            )
+        );
     }
 
     #[test]
