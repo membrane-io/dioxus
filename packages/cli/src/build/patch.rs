@@ -2334,6 +2334,9 @@ fn hash_object_functions(
     let mut symbols: Vec<SymbolInfo> = Vec::new();
     let mut relocs: Vec<wasmparser::RelocationEntry> = Vec::new();
     let mut data_relocs: Vec<wasmparser::RelocationEntry> = Vec::new();
+    // The start of the data section contents, and the range of the bytes of each segment.
+    let mut data_start = 0usize;
+    let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload? {
@@ -2361,6 +2364,14 @@ fn hash_object_functions(
             }
             Payload::CodeSectionStart { range, .. } => code_start = range.start,
             Payload::CodeSectionEntry(body) => bodies.push(body.range()),
+            Payload::DataSection(section) => {
+                data_start = section.range().start;
+                for segment in section {
+                    let segment = segment?;
+                    let end = segment.range.end;
+                    segments.push(end - segment.data.len()..end);
+                }
+            }
             Payload::CustomSection(section) => match section.as_known() {
                 KnownCustom::Linking(reader) => {
                     for subsection in reader.subsections() {
@@ -2458,6 +2469,21 @@ fn hash_object_functions(
         hidden_address_refs,
     });
 
+    // The hash of the content of each local data symbol that a function reads. rustc names
+    // the anonymous data of a codegen unit `.Lanon.<unit hash>.<counter>`, so an edit of a
+    // string or of a constant in the data section does not change the name. Without the
+    // content, such an edit gives the same function hash, and dx finds no change.
+    data_relocs.sort_by_key(|reloc| reloc.offset);
+    let mut data_hashes: HashMap<u32, u64> = HashMap::new();
+    let data = DataContent {
+        bytes,
+        data_start,
+        segments: &segments,
+        symbols: &symbols,
+        symbol_names: &symbol_names,
+        relocs: &data_relocs,
+    };
+
     relocs.sort_by_key(|reloc| reloc.offset);
     let mut next_reloc = 0;
     for (position, body) in bodies.iter().enumerate() {
@@ -2481,6 +2507,8 @@ fn hash_object_functions(
                 types.get(reloc.index as usize).hash(&mut hasher);
             } else {
                 symbol_names.get(reloc.index as usize).hash(&mut hasher);
+                data.hash(reloc.index, &mut data_hashes, &mut Vec::new())
+                    .hash(&mut hasher);
             }
             reloc.addend.hash(&mut hasher);
         }
@@ -2496,6 +2524,80 @@ fn hash_object_functions(
         }
     }
     Ok(())
+}
+
+/// The data section of one object, for the hash of the local data that a function reads.
+struct DataContent<'a> {
+    bytes: &'a [u8],
+    data_start: usize,
+    segments: &'a [std::ops::Range<usize>],
+    symbols: &'a [SymbolInfo<'a>],
+    symbol_names: &'a [String],
+    /// The relocations of the data section, sorted by offset.
+    relocs: &'a [wasmparser::RelocationEntry],
+}
+
+impl DataContent<'_> {
+    /// The hash of the content of the data symbol `index`, or `None` when the symbol is not
+    /// local data that this object defines. The hash covers the bytes with every relocation
+    /// site set to zero, the relocations, and the content of the local data that they point
+    /// to. `pending` holds the symbols of the current path, so that a cycle stops.
+    fn hash(
+        &self,
+        index: u32,
+        memo: &mut HashMap<u32, u64>,
+        pending: &mut Vec<u32>,
+    ) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+
+        let SymbolInfo::Data {
+            flags,
+            symbol: Some(defined),
+            ..
+        } = self.symbols.get(index as usize)?
+        else {
+            return None;
+        };
+        if !flags.contains(wasmparser::SymbolFlags::BINDING_LOCAL) {
+            return None;
+        }
+        if let Some(hash) = memo.get(&index) {
+            return Some(*hash);
+        }
+        if pending.contains(&index) {
+            return None;
+        }
+        let segment = self.segments.get(defined.index as usize)?;
+        let start = segment.start + defined.offset as usize;
+        let end = (start + defined.size as usize).min(segment.end);
+        let mut content = self.bytes.get(start..end)?.to_vec();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pending.push(index);
+        let first = self
+            .relocs
+            .partition_point(|reloc| self.data_start + (reloc.offset as usize) < start);
+        for reloc in &self.relocs[first..] {
+            let site = reloc.relocation_range();
+            let site = self.data_start + site.start..self.data_start + site.end;
+            if site.start >= end {
+                break;
+            }
+            let local = site.start - start..(site.end - start).min(content.len());
+            content[local].fill(0);
+            (site.start - start).hash(&mut hasher);
+            (reloc.ty as u8).hash(&mut hasher);
+            self.symbol_names
+                .get(reloc.index as usize)
+                .hash(&mut hasher);
+            self.hash(reloc.index, memo, pending).hash(&mut hasher);
+            reloc.addend.hash(&mut hasher);
+        }
+        pending.pop();
+        content.hash(&mut hasher);
+        let hash = hasher.finish();
+        memo.insert(index, hash);
+        Some(hash)
+    }
 }
 
 fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
@@ -4433,4 +4535,48 @@ fn main_sentinel(triple: &Triple) -> &'static str {
 
         _ => "main",
     }
+}
+
+#[test]
+fn data_edit_changes_the_function_hash() {
+    // rustc gives the string the same `.Lanon` name in both compiles, so only the content of
+    // the data tells the two functions apart.
+    let dir = tempfile::tempdir().unwrap();
+    let hash = |text: &str| {
+        let source = dir.path().join("lib.rs");
+        let object = dir.path().join("lib.o");
+        std::fs::write(
+            &source,
+            format!(
+                "#[unsafe(no_mangle)] pub fn f() -> &'static str {{ \"{text}\" }}\n\
+                 pub static S: &str = \"{text}\";\n\
+                 #[unsafe(no_mangle)] pub fn g() -> &'static &'static str {{ &S }}\n"
+            ),
+        )
+        .unwrap();
+        let status = std::process::Command::new("rustc")
+            .args([
+                "--edition=2024",
+                "--crate-type=lib",
+                "--target=wasm32-unknown-unknown",
+                "--emit=obj",
+                "-Copt-level=0",
+                "-o",
+            ])
+            .arg(&object)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let index = hash_file_functions(&object).unwrap();
+        (index.functions["f"].hash, index.functions["g"].hash)
+    };
+    let (f_old, g_old) = hash("hello");
+    let (f_same, g_same) = hash("hello");
+    let (f_new, g_new) = hash("hellp");
+    assert_eq!((f_old, g_old), (f_same, g_same));
+    assert_ne!(f_old, f_new);
+    // `g` reads a named static. Its content is not local data, so a patch cannot replace it
+    // and the hash does not cover it.
+    assert_eq!(g_old, g_new);
 }
