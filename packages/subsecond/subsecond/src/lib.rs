@@ -685,17 +685,30 @@ async fn apply_wasm_patch(mut table: JumpTable) {
     // compilation (V8 compiles on background threads as bytes arrive) and avoids
     // allocating + copying the whole module into a JS buffer first. Both awaits are
     // pure I/O — they touch no shared state, so the future is safe to drop here.
+    //
+    // Each failure before the commit logs the error and returns. A panic or a JS throw here
+    // ends the task of the patch queue, and then the runtime applies no later patch.
     let response: web_sys::Response =
-        JsFuture::from(web_sys::window().unwrap_throw().fetch_with_str(&path))
-            .await
-            .unwrap()
-            .unchecked_into();
+        match JsFuture::from(web_sys::window().unwrap_throw().fetch_with_str(&path)).await {
+            Ok(response) => response.unchecked_into(),
+            Err(err) => {
+                web_sys::console::error_2(
+                    &format!("[subsecond] skipping patch {path}: the fetch failed:").into(),
+                    &err,
+                );
+                return;
+            }
+        };
     if !response.ok() {
-        panic!(
-            "Failed to patch wasm module at {} - response failed with: {}",
-            path,
-            response.status_text()
+        web_sys::console::error_1(
+            &format!(
+                "[subsecond] skipping patch {path}: the server replied {} {}",
+                response.status(),
+                response.status_text()
+            )
+            .into(),
         );
+        return;
     }
     let t_fetched = js_sys::Date::now();
 
@@ -716,13 +729,15 @@ async fn apply_wasm_patch(mut table: JumpTable) {
             .await
             .map(|module| (module, len))
     } else {
-        let buf: ArrayBuffer = JsFuture::from(response.array_buffer().unwrap())
-            .await
-            .unwrap()
-            .unchecked_into();
-        JsFuture::from(WebAssembly::compile(buf.unchecked_ref()))
-            .await
-            .map(|module| (module, buf.byte_length()))
+        match JsFuture::from(response.array_buffer().unwrap()).await {
+            Ok(buf) => {
+                let buf: ArrayBuffer = buf.unchecked_into();
+                JsFuture::from(WebAssembly::compile(buf.unchecked_ref()))
+                    .await
+                    .map(|module| (module, buf.byte_length()))
+            }
+            Err(err) => Err(err),
+        }
     };
     // A patch that the browser cannot compile changes nothing. The app keeps its code, and a
     // later patch that builds on this patch skips too.
@@ -836,11 +851,18 @@ async fn apply_wasm_patch(mut table: JumpTable) {
 
         // Completeness pass over the module's declared imports. Every import must be satisfied or
         // `instantiate` throws a LinkError, so we wire the remaining function imports and stub the
-        // stragglers.
-        let stub: JsValue = js_sys::Function::new_no_args(
-            "throw new Error('subsecond: unsatisfied hot-patch import called')",
-        )
-        .into();
+        // stragglers. Each stub names its import in the error, and the runtime logs the names
+        // of all stubs, because dx found no function for them.
+        let make_stub = js_sys::Function::new_with_args(
+            "name",
+            "return function() { throw new Error('subsecond: the patch called the import ' + name + ', but dx found no function for it. Reload the page.'); }",
+        );
+        let stub = |name: &str| -> JsValue {
+            make_stub
+                .call1(&JsValue::undefined(), &JsValue::from_str(name))
+                .unwrap_or(JsValue::UNDEFINED)
+        };
+        let mut stubbed: Vec<String> = Vec::new();
         for entry in WebAssembly::Module::imports(&module).iter() {
             let ns = Reflect::get(&entry, &"module".into())
                 .ok()
@@ -864,7 +886,8 @@ async fn apply_wasm_patch(mut table: JumpTable) {
                         .map(|v| !v.is_undefined())
                         .unwrap_or(false);
                     if !satisfied {
-                        Reflect::set(&env, &key, &stub).unwrap();
+                        Reflect::set(&env, &key, &stub(&name)).unwrap();
+                        stubbed.push(name);
                     }
                 }
                 other => {
@@ -878,18 +901,33 @@ async fn apply_wasm_patch(mut table: JumpTable) {
                             o
                         }
                     };
-                    let value: JsValue = if other == "__wbindgen_placeholder__" {
-                        let saved = format!("__saved_wbg_{name}");
-                        Reflect::get(&exports, &JsValue::from_str(&saved))
-                            .ok()
-                            .filter(|v| !v.is_undefined())
-                            .unwrap_or_else(|| stub.clone())
-                    } else {
-                        stub.clone()
+                    let saved = (other == "__wbindgen_placeholder__")
+                        .then(|| {
+                            Reflect::get(&exports, &JsValue::from_str(&format!("__saved_wbg_{name}")))
+                                .ok()
+                                .filter(|v| !v.is_undefined())
+                        })
+                        .flatten();
+                    let value = match saved {
+                        Some(value) => value,
+                        None => {
+                            let value = stub(&format!("{other}.{name}"));
+                            stubbed.push(format!("{other}.{name}"));
+                            value
+                        }
                     };
                     Reflect::set(&ns_obj, &key, &value).unwrap();
                 }
             }
+        }
+        if !stubbed.is_empty() {
+            web_sys::console::warn_1(
+                &format!(
+                    "[subsecond] patch {path}: dx found no function for {} imports, and a call to one of them throws: {stubbed:?}",
+                    stubbed.len()
+                )
+                .into(),
+            );
         }
     }
 
@@ -903,9 +941,18 @@ async fn apply_wasm_patch(mut table: JumpTable) {
     // `undefined`, which silently disables every relocation below (the `Reflect::get` lookups
     // just return `Err`), leaving patch-local vtables pointing at un-rebased table indices.
     // Handle both shapes explicitly.
-    let resolved = JsFuture::from(WebAssembly::instantiate_module(&module, &imports))
-        .await
-        .unwrap();
+    let resolved = match JsFuture::from(WebAssembly::instantiate_module(&module, &imports)).await
+    {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            web_sys::console::error_2(
+                &format!("[subsecond] skipping patch {path}: the browser cannot instantiate it:")
+                    .into(),
+                &err,
+            );
+            return;
+        }
+    };
     let instance: Instance = if resolved.is_instance_of::<Instance>() {
         resolved.unchecked_into()
     } else {
