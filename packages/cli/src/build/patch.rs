@@ -1058,6 +1058,9 @@ fn create_wasm_jump_table_fast(
     let mut got_mem: Vec<(String, i32)> = Vec::new();
     let mut env_ifunc: Vec<(String, i32)> = Vec::new();
     let mut env_skipped_sig = 0usize;
+    // The `env` function imports that nothing in the base satisfies. The runtime gives each
+    // one a stub that throws when the code calls it.
+    let mut unresolved: Vec<String> = Vec::new();
 
     for name in &analysis.got_func {
         let Some(entry) = name_to_ifunc_old.get(name.as_str()).cloned() else {
@@ -1102,16 +1105,25 @@ fn create_wasm_jump_table_fast(
         // A name-matched-but-mismatched pair would fail instantiation with a LinkError; leaving it
         // out makes the runtime install a trapping stub instead, which mirrors the old
         // `call_indirect` behavior (it would only trap if actually called).
-        if let Some(&idx) = name_to_ifunc_old.get(name.as_str()) {
-            if old_sigs.get(&idx) == Some(sig) {
+        match name_to_ifunc_old.get(name.as_str()) {
+            Some(&idx) if old_sigs.get(&idx) == Some(sig) => {
                 env_ifunc.push((name.clone(), idx));
-            } else {
-                env_skipped_sig += 1;
             }
+            Some(_) => {
+                env_skipped_sig += 1;
+                unresolved.push(name.clone());
+            }
+            // wasm-bindgen removes its describe functions from the base. The patch code
+            // calls them only when the wasm-bindgen CLI runs, so the stub is enough.
+            None if name_is_bindgen_symbol(name) => {}
+            None => unresolved.push(name.clone()),
         }
     }
 
     drop(live);
+    if !unresolved.is_empty() {
+        return Err(unresolved_imports_error(&unresolved));
+    }
     let got_mutable = analysis.got_mutable.unwrap_or(true);
     let n_got_func = got_func.len();
     let n_got_mem = got_mem.len();
@@ -1426,6 +1438,7 @@ fn create_wasm_jump_table_walrus(
             _ => None,
         })
         .context("Missing ifunc table")?;
+    let mut unresolved: Vec<String> = Vec::new();
     for env_func_import in env_funcs {
         let import = new.imports.get(env_func_import);
         let ImportKind::Function(func_id) = import.kind else {
@@ -1457,7 +1470,10 @@ fn create_wasm_jump_table_walrus(
             continue;
         }
 
-        tracing::warn!("[hotpatching]: Symbol slipped through the cracks: {}", name);
+        unresolved.push(name);
+    }
+    if !unresolved.is_empty() {
+        return Err(unresolved_imports_error(&unresolved));
     }
 
     // Wire up the preserved intrinsic functions that we saved before running wasm-bindgen to the expected
@@ -4167,6 +4183,16 @@ fn read_exported_i32_global(module: &Module, export_name: &str) -> Option<i32> {
 fn name_is_wbg_cast_symbol(name: &str) -> bool {
     (name.contains("wasm_bindgen4__rt8wbg_cast") || name.contains("wasm_bindgen4___rt8wbg_cast"))
         && !name.contains("breaks_if_inline")
+}
+
+/// The error for the `env` function imports of a patch that no function of the base
+/// satisfies. A call to such an import throws in the browser, so dx does not send the patch.
+fn unresolved_imports_error(names: &[String]) -> PatchError {
+    PatchError::InvalidModule(format!(
+        "dx found no function of the base for {} function imports of the patch: {:?}",
+        names.len(),
+        &names[..names.len().min(20)]
+    ))
 }
 
 fn name_is_bindgen_symbol(name: &str) -> bool {

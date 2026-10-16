@@ -826,6 +826,36 @@ impl BuildRequest {
                 })
                 .cloned()
                 .collect();
+            // An import that no function of the base satisfies, but that an object of the link
+            // input defines. The patch must define it, else the jump table refuses the patch.
+            let not_in_base: Vec<String> = contents
+                .imported
+                .iter()
+                .filter(|name| {
+                    !contents.defined.contains_key(*name)
+                        && !live.functions.contains_key(*name)
+                        && !cache.symbol_ifunc_map.contains_key(*name)
+                        && !cache.old_exports.contains(*name)
+                        && !cache.old_imports.contains(*name)
+                        && index.functions.contains_key(*name)
+                })
+                .cloned()
+                .collect();
+            if !not_in_base.is_empty() && attempts < MAX_LINK_ATTEMPTS {
+                tracing::debug!(
+                    "The patch imports {} functions that the base does not define, dx links again: {:?}",
+                    not_in_base.len(),
+                    &not_in_base[..not_in_base.len().min(20)]
+                );
+                let selection = selection.as_mut().unwrap();
+                selection.wanted.extend(not_in_base);
+                if incremental {
+                    let mut link_callees =
+                        crate::build::patch::LinkCallees::new(index, &link_inputs);
+                    cache.add_live_callees(&live, &mut selection.wanted, &mut link_callees);
+                }
+                continue;
+            }
             if !unresolved.is_empty() && incremental {
                 let selection = selection.as_mut().unwrap();
                 if attempts < MAX_LINK_ATTEMPTS {
