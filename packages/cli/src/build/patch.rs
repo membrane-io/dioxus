@@ -2036,15 +2036,17 @@ struct LinkWalk {
 
 impl LinkWalk {
     /// Record that the link loads `object`, and the objects that `objects_for` loads with it:
-    /// the objects that define the hidden functions whose address a loaded object takes. The
-    /// link defines each such hidden function, and each function that waited for a loaded
-    /// object, so the walk follows them.
+    /// the objects that define the hidden functions whose address a loaded object takes, and
+    /// the objects that define the hidden data that a loaded object refers to. The link
+    /// defines each such hidden function, and each function that waited for a loaded object,
+    /// so the walk follows them.
     fn load(&mut self, object: usize, link_callees: &LinkCallees, needed: &HashSet<String>) {
         let mut objects = vec![object];
         while let Some(object) = objects.pop() {
             if !self.linked.insert(object) {
                 continue;
             }
+            objects.extend(link_callees.hidden_data_objects(object));
             let hidden = link_callees.hidden_address_refs(object);
             let defined = self.waiting.remove(&object).unwrap_or_default();
             for name in defined.into_iter().chain(hidden.iter().cloned()) {
@@ -2210,6 +2212,10 @@ pub struct PatchObject {
     /// code or in its data. wasm-ld fails on a table entry for an undefined hidden function,
     /// so the object that defines each one must be in the same link.
     pub hidden_address_refs: Vec<String>,
+    /// The hidden data symbols that the object does not define but reads or writes. wasm-ld
+    /// cannot import a hidden data symbol, so the object that defines each one must be in the
+    /// same link.
+    pub hidden_data_refs: Vec<String>,
 }
 
 /// The functions and the objects of a set of link inputs. See `function_hashes`.
@@ -2217,6 +2223,9 @@ pub struct PatchObject {
 pub struct ObjectIndex {
     pub functions: HashMap<String, FunctionOrigin>,
     pub objects: Vec<PatchObject>,
+    /// The object that defines each hidden data symbol that is not local, by symbol name, as
+    /// an index into `objects`. See `PatchObject::hidden_data_refs`.
+    pub hidden_data: HashMap<String, usize>,
 }
 
 /// The object index of each link input that an earlier call of `function_hashes` hashed, by
@@ -2310,6 +2319,11 @@ pub fn function_hashes(paths: &[PathBuf], cache: &FileHashCache) -> anyhow::Resu
                     },
                 )
             }));
+        index.hidden_data.extend(
+            file.hidden_data
+                .iter()
+                .map(|(name, object)| (name.clone(), object + offset)),
+        );
     }
     if hashed > 0 {
         cache.remove_missing();
@@ -2349,9 +2363,9 @@ fn hash_file_functions(path: &Path) -> anyhow::Result<ObjectIndex> {
 
 impl ObjectIndex {
     /// The objects that a link of the functions in `wanted` needs: the object that defines
-    /// each one, and the objects that define the hidden functions those objects take the
-    /// address of, in turn. Returns the object indices, and the names of the wanted or
-    /// address-taken functions that no object defines.
+    /// each one, and the objects that define the hidden functions and the hidden data that
+    /// those objects refer to, in turn. Returns the object indices, and the names of the
+    /// wanted functions and of the hidden symbols that no object defines.
     pub fn objects_for<'a>(
         &self,
         wanted: impl IntoIterator<Item = &'a str>,
@@ -2373,6 +2387,12 @@ impl ObjectIndex {
             for name in &self.objects[object].hidden_address_refs {
                 match self.functions.get(name) {
                     Some(function) => to_visit.push(function.object),
+                    None => missing.push(name.clone()),
+                }
+            }
+            for name in &self.objects[object].hidden_data_refs {
+                match self.hidden_data.get(name) {
+                    Some(defining) => to_visit.push(*defining),
                     None => missing.push(name.clone()),
                 }
             }
@@ -2438,6 +2458,14 @@ impl<'a> LinkCallees<'a> {
     /// The hidden functions whose address `object` takes, see `PatchObject`.
     fn hidden_address_refs(&self, object: usize) -> &[String] {
         &self.index.objects[object].hidden_address_refs
+    }
+
+    /// The objects that define the hidden data that `object` refers to, see `PatchObject`.
+    fn hidden_data_objects(&self, object: usize) -> impl Iterator<Item = usize> + '_ {
+        self.index.objects[object]
+            .hidden_data_refs
+            .iter()
+            .filter_map(|name| self.index.hidden_data.get(name).copied())
     }
 
     /// The object of the link input that defines `name`, as an index into
@@ -2722,11 +2750,33 @@ fn hash_object_functions(
         .collect();
     hidden_address_refs.sort_unstable();
     hidden_address_refs.dedup();
+
+    // The hidden data that the object refers to but does not define, and the hidden data
+    // that it defines for other objects.
     let object = index.objects.len();
+    let mut hidden_data_refs: Vec<String> = Vec::new();
+    for (symbol, name) in symbols.iter().zip(&symbol_names) {
+        let SymbolInfo::Data { flags, .. } = symbol else {
+            continue;
+        };
+        if !flags.contains(wasmparser::SymbolFlags::VISIBILITY_HIDDEN)
+            || flags.contains(wasmparser::SymbolFlags::BINDING_LOCAL)
+        {
+            continue;
+        }
+        if flags.contains(wasmparser::SymbolFlags::UNDEFINED) {
+            hidden_data_refs.push(name.clone());
+        } else {
+            index.hidden_data.insert(name.clone(), object);
+        }
+    }
+    hidden_data_refs.sort_unstable();
+    hidden_data_refs.dedup();
     index.objects.push(PatchObject {
         source,
         member,
         hidden_address_refs,
+        hidden_data_refs,
     });
 
     // The hash of the content of each local data symbol that a function reads. rustc names
@@ -4890,4 +4940,30 @@ fn direct_callees_reads_the_calls_of_the_object() {
         Some(vec!["g".to_string(), "h".to_string()])
     );
     assert_eq!(link_callees.callees("h"), None);
+}
+
+#[test]
+fn objects_for_loads_the_object_of_a_hidden_static() {
+    // Object 0 defines `f`, which reads the hidden static `S` of object 1. Object 2 defines
+    // `g`, which the link does not need.
+    let object = |hidden_data_refs: &[&str]| PatchObject {
+        source: 0,
+        member: None,
+        hidden_address_refs: Vec::new(),
+        hidden_data_refs: hidden_data_refs.iter().map(|name| name.to_string()).collect(),
+    };
+    let function = |object| FunctionOrigin { hash: 0, object };
+    let index = ObjectIndex {
+        functions: [("f".to_string(), function(0)), ("g".to_string(), function(2))].into(),
+        objects: vec![object(&["S", "T"]), object(&[]), object(&[])],
+        hidden_data: [("S".to_string(), 1)].into(),
+    };
+    let (objects, missing) = index.objects_for(["f"]);
+    assert_eq!(objects, [0, 1]);
+    assert_eq!(missing, ["T"]);
+
+    let mut walk = LinkWalk::default();
+    let paths = [PathBuf::new()];
+    walk.load(0, &LinkCallees::new(&index, &paths), &HashSet::new());
+    assert_eq!(walk.linked, HashSet::from([0, 1]));
 }
