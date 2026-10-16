@@ -114,6 +114,13 @@ pub struct JumpTable {
     /// (older CLI, non-wasm, or wasm-bindgen dropped the export), preserving prior behavior.
     #[serde(default)]
     pub base_id: Option<i32>,
+
+    /// The structs, the enums and the unions whose definition in the files of the patch
+    /// differs from the fat build, as "struct a::B". The data that the app made before the
+    /// patch keeps the old layout, and the patched code reads that data with the new layout.
+    /// A crash after such a patch is probably the result.
+    #[serde(default)]
+    pub layout_changes: Vec<String>,
 }
 
 /// Host-supplied values for a side-module patch's dynamic-linking imports.

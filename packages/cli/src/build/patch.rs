@@ -515,6 +515,7 @@ pub fn create_windows_jump_table(patch: &Path, cache: &HotpatchModuleCache) -> R
         retired: Vec::new(),
         wasm: None,
         base_id: None,
+        layout_changes: Vec::new(),
     })
 }
 
@@ -573,6 +574,7 @@ pub fn create_native_jump_table(
         retired: Vec::new(),
         wasm: None,
         base_id: None,
+        layout_changes: Vec::new(),
     })
 }
 
@@ -1208,6 +1210,7 @@ fn create_wasm_jump_table_fast(
             got_mutable,
         }),
         base_id: cache.base_id,
+        layout_changes: Vec::new(),
     };
     Ok((table, ifuncs))
 }
@@ -1642,6 +1645,7 @@ fn create_wasm_jump_table_walrus(
         retired: Vec::new(),
         wasm: None,
         base_id: cache.base_id,
+        layout_changes: Vec::new(),
     })
 }
 

@@ -975,6 +975,47 @@ fn body_has_visible_item(body: &Block) -> bool {
     finder.0
 }
 
+/// The structs, the enums and the unions of `old` whose definition differs in `new`, as
+/// "struct a::B". A hot patch does not change the data that the app made before the patch, so
+/// that data keeps the old layout, and the new code reads it with the new layout. The function
+/// compares the generics, the fields or the variants, and the attributes without the docs. It
+/// looks into inline modules, and it ignores a type that `new` removes.
+pub fn changed_layouts(old: &syn::File, new: &syn::File) -> Vec<String> {
+    let mut old = old.clone();
+    let mut new = new.clone();
+    Stripper.visit_file_mut(&mut old);
+    Stripper.visit_file_mut(&mut new);
+    let mut old_types = BTreeMap::new();
+    let mut new_types = BTreeMap::new();
+    collect_types(&old.items, "", &mut old_types);
+    collect_types(&new.items, "", &mut new_types);
+    old_types
+        .iter()
+        .filter(|(name, item)| new_types.get(*name).is_some_and(|new| new != *item))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Add each struct, enum and union of `items` to `types`, by its description in
+/// `changed_layouts`. `path` is the path of the inline module of `items`.
+fn collect_types<'a>(items: &'a [Item], path: &str, types: &mut BTreeMap<String, &'a Item>) {
+    for item in items {
+        let (kind, ident) = match item {
+            Item::Struct(item) => ("struct", &item.ident),
+            Item::Enum(item) => ("enum", &item.ident),
+            Item::Union(item) => ("union", &item.ident),
+            Item::Mod(module) => {
+                if let Some((_, items)) = &module.content {
+                    collect_types(items, &format!("{path}{}::", module.ident), types);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        types.insert(format!("{kind} {path}{ident}"), item);
+    }
+}
+
 fn empty_block() -> Block {
     syn::parse_quote!({})
 }
@@ -1077,9 +1118,44 @@ fn trait_item_attrs_mut(item: &mut syn::TraitItem) -> Option<&mut Vec<Attribute>
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceChange, interface_change, interface_change_in, names_in_child_modules,
-        same_interface,
+        InterfaceChange, changed_layouts, interface_change, interface_change_in,
+        names_in_child_modules, same_interface,
     };
+
+    fn layouts(old: &str, new: &str) -> Vec<String> {
+        let old = syn::parse_file(old).expect("old source parses");
+        let new = syn::parse_file(new).expect("new source parses");
+        changed_layouts(&old, &new)
+    }
+
+    #[test]
+    fn changed_layouts_names_the_changed_types() {
+        assert_eq!(
+            layouts(
+                "struct A { x: u32 } enum B { X } struct C { y: u8 } fn f() {}",
+                "struct A { x: u32, z: u8 } enum B { X, Y } struct C { y: u8 } fn f() { g() }",
+            ),
+            ["enum B", "struct A"]
+        );
+        assert_eq!(
+            layouts(
+                "mod m { #[repr(C)] pub struct S(u32); }",
+                "mod m { pub struct S(u32); }"
+            ),
+            ["struct m::S"]
+        );
+    }
+
+    #[test]
+    fn changed_layouts_ignores_docs_new_and_removed_types() {
+        assert!(
+            layouts(
+                "/// Old doc.\nstruct A { /// x\n x: u32 } struct Gone;",
+                "/// New doc.\nstruct A { /// The x.\n x: u32 } struct New;",
+            )
+            .is_empty()
+        );
+    }
 
     fn gate(old: &str, new: &str) -> bool {
         let old = syn::parse_file(old).expect("old source parses");

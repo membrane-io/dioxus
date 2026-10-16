@@ -22,7 +22,7 @@ use notify::{
     event::{MetadataKind, ModifyKind},
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, TcpListener},
     path::{Path, PathBuf},
     sync::Arc,
@@ -54,6 +54,10 @@ pub(crate) struct AppServer {
     // Tracked state related to open builds and hot reloading
     pub(crate) applied_client_hot_reload_message: HotReloadMsg,
     pub(crate) file_map: HashMap<PathBuf, CachedFile>,
+    /// The structs, the enums and the unions whose definition the edits changed since the last
+    /// patch that dx sent to the client, see `changed_layouts`. The next client patch carries
+    /// them in `JumpTable::layout_changes`.
+    pub(crate) layout_changes: BTreeSet<String>,
 
     // Resolved args related to how we go about processing the rebuilds and logging
     pub(crate) hotreload_mode: HotReloadMode,
@@ -212,6 +216,7 @@ impl AppServer {
         // Create the runner
         let mut runner = Self {
             file_map: Default::default(),
+            layout_changes: Default::default(),
             applied_client_hot_reload_message: Default::default(),
             watch_fs,
             hotreload_mode,
@@ -542,6 +547,8 @@ impl AppServer {
 
                 // Update the most recent version of the file, so when we force a rebuild, we keep operating on the most recent version
                 cached_file.most_recent = Some(new_contents);
+                self.layout_changes
+                    .extend(crate::build::changed_layouts(&old_file, &new_file));
 
                 // A module in another file can call a private function of this file. The gate
                 // needs the names in those files to treat such a function as local.
@@ -989,6 +996,7 @@ impl AppServer {
     pub(crate) fn commit_rebuilt_artifact(&mut self, id: BuildId) {
         if id == BuildId::PRIMARY {
             self.client.patches.clear();
+            self.layout_changes.clear();
             self.clear_hot_reload_changes();
         } else if let Some(server) = self.server.as_mut() {
             server.patches.clear();
@@ -1007,7 +1015,7 @@ impl AppServer {
             .duration_since(bundle.time_start)
             .unwrap_or_default();
 
-        let jump_table = match id {
+        let mut jump_table = match id {
             BuildId::PRIMARY => self.client.hotpatch(bundle, cache).await,
             BuildId::SECONDARY => {
                 self.server
@@ -1018,6 +1026,21 @@ impl AppServer {
             }
             _ => bail!("Invalid build id"),
         }?;
+
+        // The jump table that the builder keeps goes to each new client, so it gets the
+        // layout changes too.
+        if id == BuildId::PRIMARY && !self.layout_changes.is_empty() {
+            let layout_changes: Vec<String> =
+                std::mem::take(&mut self.layout_changes).into_iter().collect();
+            tracing::warn!(
+                "The patch changes the layout of {}. The data that the app made before the patch keeps the old layout, and the patched code reads it with the new layout. If the app fails, press `r` for a full rebuild.",
+                layout_changes.join(", ")
+            );
+            if let Some(stored) = self.client.patches.last_mut() {
+                stored.layout_changes = layout_changes.clone();
+            }
+            jump_table.layout_changes = layout_changes;
+        }
 
         if id == BuildId::PRIMARY {
             // The patch contains the templates that the runner replayed until now, so a new client
